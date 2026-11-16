@@ -438,7 +438,7 @@ const SingleDeckCard: React.FC<SingleDeckCardProps> = ({
           {/* Serato Beatgrid Anchor Edit Strip */}
           <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-[#1D2330] text-xs">
             <span className="font-mono tabular-nums text-slate-400">
-              Beat 1 Anchor: <strong className="text-white">{activeAnchorMs.toFixed(1)} ms</strong>
+              Beat 1 Anchor: <strong className="text-white" data-testid={`deck-${deckNum}-anchor-ms`}>{activeAnchorMs.toFixed(2)} ms</strong>
             </span>
             <div className="flex items-center gap-1">
               <button

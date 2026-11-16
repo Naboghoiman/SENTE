@@ -183,18 +183,27 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
     return w;
   }
 
+  getLoopBeats(deck) {
+    const beatSec = 60 / Math.max(40, deck.bpm);
+    const rawPlayableBeats = Math.max(0.25, (deck.durationSec - deck.anchorSec) / beatSec);
+    // Allow up to 0.14 beat (~65 ms) trim tolerance at loop tail so shy-cut loops don't drop a beat
+    const ceilBeats = Math.ceil(rawPlayableBeats);
+    const alignedBeats =
+      ceilBeats - rawPlayableBeats <= 0.14 ? ceilBeats : Math.floor(rawPlayableBeats);
+    if (alignedBeats >= 8 && alignedBeats % 4 === 0) {
+      return alignedBeats;
+    }
+    return alignedBeats >= 8
+      ? Math.floor(alignedBeats / 4) * 4
+      : alignedBeats >= 1
+        ? alignedBeats
+        : rawPlayableBeats;
+  }
+
   getTrackTimeSec(deck, beatPos) {
     if (!deck || !deck.channels || deck.length < 2) return -1;
     const beatSec = 60 / Math.max(40, deck.bpm);
-    const rawPlayableBeats = Math.max(0.25, (deck.durationSec - deck.anchorSec) / beatSec);
-    const wholeBeats = Math.floor(rawPlayableBeats);
-    // Align loop boundary to whole bars when >= 8 beats so continuous loops keep downbeat order
-    const loopBeats =
-      wholeBeats >= 8
-        ? Math.floor(wholeBeats / 4) * 4
-        : wholeBeats >= 1
-          ? wholeBeats
-          : rawPlayableBeats;
+    const loopBeats = this.getLoopBeats(deck);
     const wrappedBeat = ((beatPos % loopBeats) + loopBeats) % loopBeats;
 
     if (deck.useBeatTimes && deck.beatTimesSec && deck.beatTimesSec.length >= 2) {
@@ -225,6 +234,35 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
     const s0 = ch[i0];
     const s1 = ch[i0 + 1];
     return s0 + frac * (s1 - s0);
+  }
+
+  /**
+   * Renders fractional sample with seamless 3 ms pre-roll cosine crossfade at the loop seam
+   * so DJ loops blend cleanly without clicks while keeping Beat 1 at exact 0.000 ms.
+   */
+  sampleDeckAtBeat(deck, chIdx, beatPos) {
+    if (!deck || !deck.channels || deck.length < 2) return 0;
+    const beatSec = 60 / Math.max(40, deck.bpm);
+    const loopBeats = this.getLoopBeats(deck);
+    const wrappedBeat = ((beatPos % loopBeats) + loopBeats) % loopBeats;
+    const timeSec = this.getTrackTimeSec(deck, wrappedBeat);
+    const baseSample = this.sampleDeckChannel(deck, chIdx, timeSec);
+
+    const secRemaining = (loopBeats - wrappedBeat) * beatSec;
+    if (secRemaining < 0.003 && loopBeats >= 1) {
+      if (deck.anchorSec >= 0.003) {
+        const progress = (0.003 - secRemaining) / 0.003;
+        const fadeIn = 0.5 - 0.5 * Math.cos(Math.PI * progress);
+        const preSample = this.sampleDeckChannel(deck, chIdx, deck.anchorSec - secRemaining);
+        return baseSample * (1 - fadeIn) + preSample * fadeIn;
+      }
+      if (secRemaining < 0.0015) {
+        const taper = secRemaining / 0.0015;
+        return baseSample * (0.5 - 0.5 * Math.cos(Math.PI * taper));
+      }
+    }
+
+    return baseSample;
   }
 
   computeCurrentErrorMetrics() {
@@ -345,23 +383,20 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
       let r = 0;
 
       if (hasD1) {
-        const t1 = this.getTrackTimeSec(d1, this.masterBeatPos);
-        l += this.sampleDeckChannel(d1, 0, t1) * g1;
-        r += this.sampleDeckChannel(d1, 1, t1) * g1;
+        l += this.sampleDeckAtBeat(d1, 0, this.masterBeatPos) * g1;
+        r += this.sampleDeckAtBeat(d1, 1, this.masterBeatPos) * g1;
       }
 
       if (hasD2) {
-        const t2 = this.getTrackTimeSec(d2, this.deck2BeatPos);
-        let d2L = this.sampleDeckChannel(d2, 0, t2);
-        let d2R = this.sampleDeckChannel(d2, 1, t2);
+        let d2L = this.sampleDeckAtBeat(d2, 0, this.deck2BeatPos);
+        let d2R = this.sampleDeckAtBeat(d2, 1, this.deck2BeatPos);
 
         if (this.xfadeRemaining > 0) {
           const progress = 1 - this.xfadeRemaining / this.xfadeTotalSamples;
           const fadeIn = 0.5 - 0.5 * Math.cos(Math.PI * progress);
           const fadeOut = 1 - fadeIn;
-          const tOld = this.getTrackTimeSec(d2, this.xfadeOldBeatPos);
-          const oldL = this.sampleDeckChannel(d2, 0, tOld);
-          const oldR = this.sampleDeckChannel(d2, 1, tOld);
+          const oldL = this.sampleDeckAtBeat(d2, 0, this.xfadeOldBeatPos);
+          const oldR = this.sampleDeckAtBeat(d2, 1, this.xfadeOldBeatPos);
           d2L = oldL * fadeOut + d2L * fadeIn;
           d2R = oldR * fadeOut + d2R * fadeIn;
           this.xfadeOldBeatPos += d2StepPerSample;

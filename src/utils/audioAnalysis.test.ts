@@ -9,32 +9,35 @@ import {
   sampleTrackPeak,
 } from './audioAnalysis';
 
-test('detectFirstTransientMs finds zero-offset kick near 0–8 ms and detects 18 ms MP3 padding', () => {
-  const sr = 22050;
+test('detectFirstTransientMs finds kick onset within <= 0.20 ms on clean and +18 ms padded audio', () => {
+  const sr = 44100;
   const clean = generateTestAudioPcm(124, 4, sr, 0, 'master');
   const cleanMs = detectFirstTransientMs(clean, sr);
-  assert.ok(cleanMs >= 0 && cleanMs <= 8, `Expected near 0-8ms, got ${cleanMs}`);
+  assert.ok(cleanMs >= 0 && cleanMs <= 0.2, `Expected <= 0.20 ms on clean start, got ${cleanMs} ms`);
 
   const padded = generateTestAudioPcm(124, 4, sr, 18.0, 'incoming');
   const paddedMs = detectFirstTransientMs(padded, sr);
-  assert.ok(paddedMs >= 16 && paddedMs <= 26, `Expected near 18-26ms, got ${paddedMs}`);
+  assert.ok(
+    Math.abs(paddedMs - 18.0) <= 0.2,
+    `Expected within <= 0.20 ms of 18.0 ms, got ${paddedMs} ms`
+  );
 });
 
-test('analyzeBeatGrid recovers exact 124.0 BPM, straight tempo, and sub-5ms anchor from padded groove', () => {
-  const sr = 22050;
+test('analyzeBeatGrid recovers exact 124.0 BPM, straight tempo, and <= 0.20 ms anchor from +14.2 ms padded groove', () => {
+  const sr = 44100;
   const pcm = generateTestAudioPcm(124, 16, sr, 14.2, 'incoming');
   const grid = analyzeBeatGrid(pcm, sr);
   assert.equal(grid.bpm, 124, `Expected exact 124 BPM, got ${grid.bpm}`);
   assert.equal(grid.isConstantTempo, true);
-  assert.ok(grid.gridResidualMs < 4, `Expected tight residual, got ${grid.gridResidualMs}`);
+  assert.ok(grid.gridResidualMs < 0.5, `Expected tight residual, got ${grid.gridResidualMs}`);
   assert.ok(
-    Math.abs(grid.firstTransientMs - 16) < 6,
-    `Expected anchor near 14-20ms, got ${grid.firstTransientMs}`
+    Math.abs(grid.firstTransientMs - 14.2) <= 0.2,
+    `Expected anchor within <= 0.20 ms of 14.20 ms, got ${grid.firstTransientMs} ms`
   );
 });
 
-test('analyzeBeatGrid ignores quiet high-frequency intro pad and locks onto true kick downbeat', () => {
-  const sr = 22050;
+test('analyzeBeatGrid ignores quiet high-frequency intro pad and locks onto true kick downbeat within <= 0.20 ms', () => {
+  const sr = 44100;
   const introSec = 2.0;
   const mainPcm = generateTestAudioPcm(126, 16, sr, 0, 'master');
   const full = new Float32Array(Math.floor(sr * introSec) + mainPcm.length);
@@ -49,8 +52,8 @@ test('analyzeBeatGrid ignores quiet high-frequency intro pad and locks onto true
   const grid = analyzeBeatGrid(full, sr);
   assert.equal(grid.bpm, 126, `Expected exact 126 BPM, got ${grid.bpm}`);
   assert.ok(
-    Math.abs(grid.firstTransientMs - 2000) < 25,
-    `Expected Beat 1 anchor near 2000ms kick entry, got ${grid.firstTransientMs}`
+    Math.abs(grid.firstTransientMs - 2000.0) <= 0.2,
+    `Expected Beat 1 anchor within <= 0.20 ms of 2000.00 ms kick entry, got ${grid.firstTransientMs} ms`
   );
 });
 
@@ -98,8 +101,8 @@ test('analyzeBeatGrid tracks real kick peaks continuously across a 90s tempo-dri
   assert.ok(errLateMs < 4.5, `Expected <4.5 ms error near end of 90s drifting song, got ${errLateMs.toFixed(2)} ms`);
 });
 
-test('analyzeBeatGrid preserves constant-tempo 0 ms phase lock across a 24-beat silent breakdown', () => {
-  const sr = 22050;
+test('analyzeBeatGrid preserves constant-tempo <= 0.20 ms phase lock across a 24-beat silent breakdown', () => {
+  const sr = 44100;
   const bpm = 126;
   const beatSec = 60 / bpm;
   const durationSec = 45;
@@ -115,14 +118,86 @@ test('analyzeBeatGrid preserves constant-tempo 0 ms phase lock across a 24-beat 
   const grid = analyzeBeatGrid(full, sr);
   assert.equal(grid.bpm, 126, `Expected 126 BPM, got ${grid.bpm}`);
   assert.equal(grid.isConstantTempo, true, 'Expected constant-tempo lock across breakdown');
-  assert.ok(grid.gridResidualMs < 3.5, `Expected <3.5 ms residual, got ${grid.gridResidualMs}`);
+  assert.ok(
+    Math.abs(grid.firstTransientMs - 12.0) <= 0.2,
+    `Expected <= 0.20 ms anchor lock, got ${grid.firstTransientMs} ms`
+  );
 
-  // Verify post-breakdown beat 56 aligns within 3 ms of ground truth
+  // Verify post-breakdown beat 56 aligns within <= 0.20 ms of ground truth
   const expectedBeat56Sec = 0.012 + 56 * beatSec;
   const errAfterBreakdownMs = Math.abs(grid.beatTimesSec[56] - expectedBeat56Sec) * 1000;
   assert.ok(
-    errAfterBreakdownMs < 3.0,
-    `Expected <3 ms phase error after breakdown, got ${errAfterBreakdownMs.toFixed(2)} ms`
+    errAfterBreakdownMs <= 0.2,
+    `Expected <= 0.20 ms phase error after breakdown, got ${errAfterBreakdownMs.toFixed(3)} ms`
   );
 });
 
+test('analyzeBeatGrid handles short 1-bar DJ loops (< 2.0s) with <= 0.20 ms anchor accuracy', () => {
+  const sr = 44100;
+  const bpm = 124;
+  // Exact 1-bar loop (1.935s) + 16.75 ms encoder pad
+  const oneBarDuration = (4 * 60) / bpm + 0.03;
+  const loopPcm = generateTestAudioPcm(bpm, oneBarDuration, sr, 16.75, 'incoming');
+  const grid = analyzeBeatGrid(loopPcm, sr);
+  assert.equal(grid.bpm, 124, `Expected 124 BPM on 1-bar loop, got ${grid.bpm}`);
+  assert.ok(
+    Math.abs(grid.firstTransientMs - 16.75) <= 0.2,
+    `Expected <= 0.20 ms on 1-bar loop, got ${grid.firstTransientMs} ms`
+  );
+});
+
+test('analyzeBeatGrid eliminates sub-bass comb BPM drift on club tracks with 95 Hz bassline & 240 Hz snare', () => {
+  const sr = 44100;
+  for (const bpm of [126, 128, 132]) {
+    const dur = 48;
+    const n = sr * dur;
+    const pcm = new Float32Array(n);
+    const beatSec = 60 / bpm;
+    for (let i = 0; i < n; i++) {
+      const t = i / sr - 0.0185;
+      if (t < 0) continue;
+      const bp = t / beatSec;
+      const bIdx = Math.floor(bp);
+      const kt = (bp - bIdx) * beatSec;
+      let v = 0;
+      if (bIdx >= 16) {
+        const bassEnv = 0.3 + 0.7 * Math.min(1, kt / 0.08);
+        v += Math.sin(2 * Math.PI * 95 * t) * 0.35 * bassEnv;
+      }
+      if (kt < 0.14) {
+        const kg = bIdx < 16 ? 0.45 : 0.85;
+        v += Math.sin(2 * Math.PI * (50 + 140 * Math.exp(-kt * 48)) * kt) * Math.exp(-kt * 25) * kg;
+      }
+      if (bIdx % 2 === 1 && kt < 0.09) {
+        v += Math.sin(2 * Math.PI * 240 * kt) * Math.exp(-kt * 35) * 0.4;
+      }
+      pcm[i] = Math.max(-0.98, Math.min(0.98, v));
+    }
+    const grid = analyzeBeatGrid(pcm, sr);
+    assert.equal(grid.exactBpm, bpm, `Expected exact ${bpm} BPM, got ${grid.exactBpm}`);
+    assert.equal(grid.isConstantTempo, true);
+    assert.ok(
+      Math.abs(grid.firstTransientMs - 18.5) <= 0.2,
+      `Expected <= 0.20 ms anchor on ${bpm} BPM club track, got ${grid.firstTransientMs} ms`
+    );
+  }
+});
+
+test('analyzeBeatGrid switches to dynamic beat tracking for subtle 0.12 BPM drift', () => {
+  const sr = 22050;
+  const dur = 45;
+  const n = sr * dur;
+  const pcm = new Float32Array(n);
+  let t = 0.01;
+  while (t < dur - 0.1) {
+    const instBpm = 124.0 + 0.12 * (t / dur);
+    const s0 = Math.floor(t * sr);
+    for (let k = 0; k < Math.floor(0.1 * sr) && s0 + k < n; k++) {
+      const kt = k / sr;
+      pcm[s0 + k] += Math.sin(2 * Math.PI * (54 + 120 * Math.exp(-kt * 45)) * kt) * Math.exp(-kt * 28) * 0.8;
+    }
+    t += 60 / instBpm;
+  }
+  const grid = analyzeBeatGrid(pcm, sr);
+  assert.equal(grid.isConstantTempo, false, 'Expected dynamic beatgrid mode for 0.12 BPM drift');
+});
