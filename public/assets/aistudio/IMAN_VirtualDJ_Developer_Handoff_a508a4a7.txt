@@ -1,0 +1,234 @@
+# VirtualDJ principles and IMAN implementation handoff
+
+Prepared for NABOGHO IMAN and the IMAN developer — 16 November 2026.
+
+**Main finding:** treat tempo matching, beat-phase alignment, musical beat order, continuous locking, loop boundaries and audio-output latency as separate problems. Matching the BPM number alone cannot provide stable audible kick blending.
+
+This package provides inspected build evidence, documented behavior, and an original implementation specification. It does **not** contain VirtualDJ's original source code, recovered private DSP algorithms or a proven recreation of its engine. The Windows program was statically inspected, not installed or played here. No IMAN APK was changed for this handoff.
+
+## 1. Evidence and version boundary
+
+Labels throughout this handoff:
+
+- **E — Installer evidence:** directly observed in the supplied installer, executable metadata, embedded English help or skin resources. Help text establishes intended behavior, not measured runtime accuracy.
+- **D — Documentation:** official public manuals/changelog. Current pages may describe features added after the inspected build.
+- **R — Recommendation:** original engineering proposal for IMAN; not a claim about VirtualDJ's private implementation.
+- **U — Unknown:** not established by the inspection.
+
+| Item | Verified result |
+|---|---|
+| Drive file | `install_virtualdj_2021_b6106_pc.msi` |
+| Drive location | Google AI Studio folder; [installer](https://drive.google.com/file/d/117iDNvDLIXsAUmXkKR3aRP29cXIfqyEY/view?usp=drivesdk) |
+| Installer size | 192,102,400 bytes |
+| Installer SHA-256 | `04bd5d5f79985acc18fcfc0f6ffa4a078cb1ff426b4fd0749e291409b5d53985` |
+| Extracted executable | `virtualdj.exe`, 235,952,632 bytes, Windows x86-64 |
+| Executable metadata | Atomix Productions; file/product version `8.5`; copyright 2012–2020 |
+| Executable SHA-256 | `4c5eae830eed63bbe0e5832943f64c7c6d2e5682a34dcf31bdb3fad158d8da14` |
+| Build/date qualification | Filename identifies b6106; the official changelog dates build 6106 to **14 September 2020**. “2021” is the product name, not its release year. The inspected executable version resource alone says 8.5, not 6106. [S7] |
+| Extraction | One embedded cabinet; 29 files. The executable includes English help and several skin XML resources. |
+
+**E:** Embedded English help explicitly distinguishes `sync`, `beatlock`, `pitch_lock`, `master_tempo`, `key_lock`, `masterdeck`, `play_sync_onbeat`, `smart_loop`, `quantize_loop`, `slip_mode` and `loop_roll`. Sampler configuration includes Sync-Start and Sync-Lock labels. Several default skins reference sync, beatlock and pitch-lock separately.
+
+**U:** No named DSP/sync functions were exposed through normal PE exports; the inspected export inventory contained a GPU-related export. This does not rule out deeper disassembly, but this work has not recovered exact phase-controller equations, thresholds, beat-detector internals, time-stretch algorithms or complete source-level call graphs. Presence of imported audio/graphics libraries does not identify a particular private engine algorithm. No executable signature authenticity validation was performed.
+
+## 2. What each synchronization principle means
+
+The distinctions below are supported by the inspected build's embedded help. [E1] Official command documentation supplies a public cross-check. [S1]
+
+| Operation | Meaning | What it does not establish |
+|---|---|---|
+| BPM/tempo match | Set the follower's effective musical speed to the master's | Correct starting phase or downbeat |
+| SYNC | Match tempo and move toward beat alignment | That a persistent lock is enabled |
+| Beatlock | Maintain synchronization through supported transport/pitch actions | That a wrongly analyzed grid becomes correct |
+| Pitch Lock | Link tempo-slider changes so matched speeds remain related | Audio key preservation |
+| Master Tempo / Key Lock | Change playback speed while preserving a key reference | Beat-phase synchronization |
+| Master deck | Select the synchronization reference | That the loudest transient is the downbeat |
+| Local-beat sync | Align using nearby beat information rather than only the global grid | Reliable behavior in silence or every rhythm |
+| Quantize | Schedule/place an operation on a chosen musical subdivision | Continuous drift correction |
+
+**R — IMAN contract:** preserve the current rhythmic matcher and existing deck SYNC realignment. A timing follower must not secretly choose a new whole-beat order while correcting a small phase error. Make acquisition, explicit realignment and maintenance separate state transitions. Do not make the SYNC button start an unrelated stationary deck.
+
+## 3. Grid accuracy, phase and musical order
+
+**D:** The BPM editor distinguishes grid positioning, downbeat correction and tempo correction, including half/double BPM handling. Current documentation also describes rigid and fluid grids. Treat modern fluid-grid behavior as a current-documentation reference, not proof that b6106 implements the same version of it. [S2]
+
+**R:** Store these independently for each track:
+
+1. Ordered beat timestamps, with confidence and analysis revision.
+2. Which beat is the downbeat and the bar/phrase numbering.
+3. Tempo family relative to another track: half, normal or double, when musically justified.
+4. The chosen song-to-loop beat relationship.
+5. Local timing residual and output-path latency.
+
+A kick exactly on a grid marker can still be on beat 2 rather than beat 1. A rhythm can sound reversed despite a small nearest-beat error. Conversely, a correct musical pattern can have a constant 15 ms processing delay. Do not fix one category by changing another.
+
+For a constant-tempo section, define a beat coordinate:
+
+`beat(t) = (t - first_beat_time) * BPM / 60`.
+
+For a variable grid, interpolate between verified adjacent beat timestamps. The inverse mapping must agree with the forward mapping and remain monotonic. Do not keep overwriting a good grid with an uncertain transient estimate. Publish a complete immutable analysis snapshot; never mutate the live grid halfway through an audio block.
+
+**Diagnostic example:** a 0.1 BPM mismatch at 120 BPM accumulates approximately 150 ms of timing separation over three minutes. A constant 15 ms error that does not grow is a different fault. Record both error offset and error slope.
+
+## 4. Loop and sampler modes
+
+**D:** VirtualDJ distinguishes ordinary one-shot playback from looping. Its documented loop-sample modes separate unchanged playback, tempo following, phase-aligned start, and start at the master's corresponding beat number. This mode distinction also appears in the older official VirtualDJ 8 guide, predating the inspected installer. [S3, S4]
+
+**D:** Smart Loop adjusts loop boundaries; quantization positions loop actions on a selected subdivision; roll retains an underlying song position for release. These are distinct features. [S5]
+
+**R — implement explicit modes:**
+
+| IMAN mode | Required behavior |
+|---|---|
+| Drum / one-shot | Trigger on touch-down after preparation; no deliberate musical wait unless the user enables quantization |
+| Repeating loop without sync | Repeat defined source boundaries without changing musical speed automatically |
+| Tempo-following loop | Match musical speed; retain a separately defined phase relationship |
+| Aligned loop start | Begin on the selected master subdivision |
+| Persistent phase-following loop | Maintain the approved song/loop relationship after launch and tempo changes |
+| Loop roll | Repeat temporary audio while an independent unwrapped transport continues; resume that transport on release |
+
+Do not equate “Sync-Lock” in a sample editor with an undocumented promise of a particular sample-by-sample controller. The original engine's controller implementation remains unknown.
+
+For an imported loop, retain exact source start/end frames, selected beat count, downbeat/phase metadata and sample rate. Do not force every clip to a power-of-two beat length. Fractional lengths and valid non-power-of-two phrases need explicit support. A wrong beat count cannot be repaired by tighter clock locking.
+
+If the clip contains a pickup or silence before its kick, file position zero is not necessarily its musical origin. A seamless join and a correctly phased kick are separate checks. Use a short boundary transition when appropriate, but do not crossfade away the kick attack or stretch a defective loop repeatedly to hide an incorrect endpoint.
+
+## 5. Original timing specification for the developer
+
+Everything in this section is **R**, not recovered VirtualDJ code.
+
+### 5.1 One transport owner
+
+Use the audio-render frame counter as the common logical clock. UI timers may update displays and request commands; they must not advance deck or loop positions. Decode, analysis, waveform preparation, cache work and video rendering belong off the real-time rendering path.
+
+Every audio command carries a target frame, deck/voice identity and generation. Discard commands belonging to an unloaded track or retired voice. Apply each accepted command once. Preserve one coherent state snapshot across the entire output block.
+
+### 5.2 Separate the musical decision from continuous following
+
+Let:
+
+- `b_m(n)` be the master's unwrapped beat position at output-render frame `n`.
+- `r` be the approved tempo-family multiplier, such as 0.5, 1 or 2.
+- `b_l0` be the loop phase selected by the existing matcher or explicit SYNC.
+- `n0` be the command's commit frame.
+- `N` be the exact loop length in beats.
+
+At alignment, commit `delta = b_l0 - r * b_m(n0)`.
+
+Then maintain:
+
+`b_l(n) = r * b_m(n) + delta`
+
+`local_beat(n) = positive_mod(b_l(n), N)`.
+
+This preserves the chosen musical order; it does not identify which order is correct. Do not recompute `delta` from noisy nearest-kick detections every block. An explicit SYNC, approved pattern update, track replacement or master handover may intentionally replace it.
+
+For a metrically uniform source loop with source start frame `f0` and actual frame span `F`:
+
+`source_frame(n) = f0 + local_beat(n) * F / N`.
+
+If the source really has uneven internal beats, use a validated monotonic source-beat-to-frame map instead of assuming uniform spacing. This choice must come from analysis/metadata, not from a runtime guess that silently changes the phrase. Interpolate source samples continuously; do not round each playback position to an integer frame.
+
+The local playback-rate requirement follows the change in the unwrapped source coordinate. At a wrap, use the unwrapped increment or a cyclic difference; subtracting wrapped positions directly creates a false large negative speed.
+
+### 5.3 Repair residual error without unstable chasing
+
+Choose one authoritative position/rate owner per voice. Do not run an independent free-running oscillator, a PI speed correction and a direct-position overwriter simultaneously unless their interaction is deliberately designed and tested.
+
+If position is derived from the master timeline, preserve continuity across revised analysis snapshots and commands. If using a feedback controller instead, specify its units, saturation, anti-windup, discontinuity handling and re-acquisition behavior. No controller gains are supplied as “VirtualDJ's values”; those were not recovered.
+
+Any large intentional seek needs an explicit event and an appropriate transition. Do not treat scratch, cue jumps, pause/resume or changed loop length as ordinary drift. Keep an audible-error metric separate from an internal grid-coordinate metric.
+
+### 5.4 SYNC and handover
+
+The existing IMAN SYNC action must remain authoritative. Commit the chosen alignment, reset stale follower state, and continue following from that new state. Repeated presses must not alternate the rhythm or walk the loop away from the song.
+
+At a master change, use the new deck's own musical relationship. Do not copy the former master's beat offset blindly. The current IMAN midpoint handover requirement must be retained; implement one controlled reference-switch event rather than repeated switches from tiny crossfader movements. Prepare the replacement relationship before the switch when possible. Define and expose what happens if the new relationship is not ready, rather than guessing silently.
+
+### 5.5 Roll, cue and platter
+
+Maintain both the audible temporary position and a hidden unwrapped transport. During a roll, advance the latter using the actual varying transport rate. On release, resume it. Multiplying total held time by only the release-time tempo is wrong when tempo changed during the hold.
+
+Preserve IMAN's accepted cue contract: hold to preview, release to return, and PLAY while held commits continued playback. Quantization must be an explicit policy, separate from touch-down responsiveness. Platter scratch controls source motion; it must not reset the song/looper rhythm matcher with every movement.
+
+## 6. Key lock, pitch and output alignment
+
+**E:** Embedded help defines key preservation separately from linked tempo sliders. **D:** Current options documentation also separates Master Tempo from tempo-control settings. [E1, S6]
+
+Everything below is **R**:
+
+- Tempo ratio and musical transposition are independent controls. A semitone change `k` corresponds to a pitch ratio `2^(k/12)`, but changing a raw resampler's rate alone also changes duration. Key-preserving tempo adjustment requires a suitable time-stretch implementation.
+- Do not name a particular commercial algorithm as VirtualDJ's engine without evidence. Select an independently licensed DSP library or implement your own, then test its artifacts and latency.
+- Measure each processing branch's latency. If song processing delays audio by `L_song` frames and the loop by `L_loop`, align their outputs before judging audible phase. One clear approach is to delay faster branches to `max(L_song, L_loop, ...)`.
+- Do not apply both branch-delay compensation and a source advance for the same latency unless the timing model explicitly requires both. Verify compensation sign with an impulse.
+- Prime/reset stretch state deliberately after seeks, source changes and mode changes. Do not let stale overlap buffers play across unrelated tracks.
+- Do not use the phase indicator alone as evidence. Capture post-DSP audio from the actual master bus, including key lock, EQ and FX settings used in the test.
+
+## 7. Stability and Android implementation
+
+**E:** The inspected build's help describes CPU/quality trade-offs, limited long-track preloading and reduced loading priority. Its `pitchQuality` range is 0–3. Current public documentation lists 1–4; do not copy numeric settings between versions as if they were identical. [E1, S6]
+
+**D:** Android's official low-latency guidance recommends callback-based output, avoiding blocking/allocations in callbacks, native-rate operation and buffer tuning based on underruns. Oboe uses AAudio on API 27+ and a fallback on older Android. This is Android guidance, not a finding about VirtualDJ. [S8]
+
+**R — production design:**
+
+1. Prefer one well-defined audio graph and logical transport clock. Consider a native Oboe output path in a source-based build; do not migrate the entire app blindly while debugging one regression.
+2. Preallocate render buffers, use bounded command queues, and keep decoding/analysis outside the audio callback. Publish immutable results with explicit lifetime ownership.
+3. Do not free native DSP objects while they can still render. Retire them and destroy them only after the audio thread has acknowledged it no longer owns them. A temporary monitor guard can prevent a specific race, but a mature real-time callback should not wait on worker-held locks.
+4. Bound caches, worker queues and retained tracks. Test 32-bit and 64-bit memory behavior. A 5 GiB disk-cache target is not a permission to hold 5 GiB in RAM or map it all at once.
+5. Handle short writes/errors correctly if retaining AudioTrack. With Oboe/AAudio, follow the chosen callback contract instead of porting a blocking-write loop unchanged. Reopen failed devices through a controlled non-real-time recovery state.
+6. Keep recording on a bounded asynchronous path. Define a visible overflow policy; do not silently stall rendering. Record the intended master bus and exclude headphone preview according to IMAN's accepted routing.
+7. Synchronize video to audio timestamps. Do not let video decode/render work alter the audio transport clock. Exercise background return and device-route changes.
+8. Prepare drum samples before performance, trigger at touch-down, and measure end-to-end response. Literal zero-microsecond hardware response is not achievable; no such claim should appear in acceptance criteria.
+
+## 8. Handoff scope for the existing IMAN builds
+
+Conversation decisions to preserve:
+
+- **Chosen:** IMAN Drum Sampler Test 25. Do not overwrite it or promote another build without the user's selection.
+- Test 26 was explicitly rejected. Do not carry its kick-analysis changes forward.
+- Test 27 was described as promising, with poor stability. Test 28 is the delivered stability experiment based on it; there is no user confirmation here that Test 28 solved the problem.
+- Preserve the accepted hot loop, beat roll, cue, sampler/drum upload behavior, and existing SYNC realignment. Keep deck-to-deck sync changes separate from looper-following changes.
+
+The supplied reference model is a mathematical teaching/test model only. It does not replace Android playback, native DSP, analysis, fractional resampling or the existing IMAN app. It contains no proprietary VirtualDJ program code.
+
+## 9. Acceptance evidence the developer must return
+
+All numeric goals below are **proposed IMAN test targets**, not VirtualDJ specifications or achieved phone results.
+
+| Test | Required evidence |
+|---|---|
+| Coordinate following | At least 30 minutes of known constant and varying beat maps; no accumulating cyclic-coordinate error beyond numerical tolerance; include loop wraps and half/double families |
+| Audible alignment | Render/capture song and loop branches after their real DSP paths; report median, 95th percentile, worst gap and signed error slope. A provisional target for clearly annotated supported fixtures is median <=3 ms and 95th <=8 ms; review failures rather than hiding them |
+| Detector validity | Report all expected annotated attacks, detections, misses and rejected/ambiguous events. Do not report only the easiest matched kicks as an all-song success |
+| SYNC | Deliberately misalign, press once, verify the intended rhythm and phase return; repeat without alternating offsets |
+| Handover | A→B and B→A, both decks with different sections and tempos; retain each new master's own musical relationship |
+| Pad transport | Rolls held across tempo changes; cue hold/release/PLAY commit; repeated one-shots and multi-touch; compare accepted behavior |
+| Key lock | Repeat timing tests with key lock off/on and transposition; measure branch delay and sound quality separately |
+| Stability | At least 1,000 automated replacements and a 2-hour real-device session; native handles, memory and thread counts must plateau; preserve timing under loading, recording, pad use and app lifecycle changes |
+| Real-time budget | Measure callback duration distribution, worst case, underruns and route recovery. At 48 kHz a 256-frame block is 5.33 ms; processing must finish within the actual device's callback deadline with safety margin |
+| Device response | Measure touch-to-audio latency on the user's phone and additional low/mid/high-range devices, using speaker/wired output and Bluetooth separately |
+
+Start with deterministic impulses and clicks, then off-grid source attacks, then real songs with independently checked beat annotations. Include Bayuda as a known historical comparison, but do not generalize success on Bayuda to every song. Retain failing songs and exact settings as regression fixtures.
+
+Developer deliverables: reproducible source build, explicit change list, protected-baseline comparison, signed test APK, automated results, post-DSP audio captures, and a short real-phone test log. Build/signature success alone is not a stability certificate.
+
+## 10. Unknowns and next experiment
+
+Not recovered: private DSP source, exact detector features, continuous-lock gain schedules, smoothing coefficients, internal sample-clock topology, branch latency implementation and every build-specific edge case. Static command/help presence cannot prove perfect performance.
+
+Recommended next experiment: instrument the current accepted looper without changing its musical decisions. Measure source position, chosen beat offset, effective playback rate, wrap events, reference changes and post-DSP attack gaps together. Classify the observed problem as constant latency, gradual rate drift, boundary error, reference switching or wrong rhythmic order. Then change only the responsible layer.
+
+## Sources and inspection locators
+
+- **E1:** User-supplied installer → cabinet → `virtualdj.exe` → RCDATA `LANGUAGES.ZIP` / `English.xml`; Actions, Settings, Config and tooltips sections. Additional command references occur in RCDATA `SKIN.ZIP` / default skin XML. Metadata and short feature-presence inventory are supplied in `inspection_evidence.json`; binaries, artwork and factory sounds are excluded.
+- **S1:** [Official VDJScript command list](https://virtualdj.com/manuals/virtualdj/appendix/vdjscriptverbs.html) — synchronization/control distinctions.
+- **S2:** [Official BPM editor manual](https://virtualdj.com/manuals/virtualdj/editors/bpmeditor.html) — current grid editing; modern fluid-grid details are version-qualified.
+- **S3:** [Official sample editor manual](https://virtualdj.com/manuals/virtualdj/editors/sampleeditor.html) — current sample modes.
+- **S4:** [Official VirtualDJ 8 User Guide](https://virtualdj.com/documents/Manuals/VirtualDJ8_User_Guide.pdf), printed pages 72–74 — older sample modes and trigger behavior.
+- **S5:** [Official loop manual](https://virtualdj.com/manuals/virtualdj/interface/decks/decksadvanced/loops.html) — Smart Loop, quantization and roll behavior.
+- **S6:** [Official options list](https://virtualdj.com/manuals/virtualdj/appendix/optionslist.html) — current settings and performance trade-offs; do not assume numeric equivalence with the installer.
+- **S7:** [Official changelog](https://virtualdj.com/products/virtualdj/changelog.html), build 6106 — release dated 2020-09-14.
+- **S8:** [Android low-latency audio guidance](https://developer.android.com/games/sdk/oboe/low-latency-audio) — callback constraints, native sample rate, buffer tuning and Oboe API selection.
+
+Public sources checked 16 November 2026. The engineering equations, test targets and reference Python model are original recommendations, not quoted VirtualDJ internals.
