@@ -5,6 +5,11 @@ import { PhaseCanvasStage, type LoadedTracksRefPayload } from './components/Phas
 import { CalibrationControls } from './components/CalibrationControls';
 import { DjayGuideSection } from './components/DjayGuideSection';
 import { DriftCalculatorSection } from './components/DriftCalculatorSection';
+import {
+  findOptimalSemitoneMatch,
+  matchRhythmicStartingPoint,
+  transposeKeyInfo,
+} from './utils/audioAnalysis';
 import { audioEngine, type LoadedDeckTrack, type WorkletParamsPayload } from './utils/audioEngine';
 import {
   type CalibrationState,
@@ -42,7 +47,23 @@ const EMPTY_DECK: DeckUiInfo = {
   error: null,
   manualBpm: null,
   manualAnchorMs: null,
+  startBeatOffset: 0,
+  tempoMultiplier: 1,
+  rhythmMatchPct: null,
+  keyLock: true,
+  keyShiftSemitones: 0,
 };
+
+function computeSoloStartBeat(track: LoadedDeckTrack): number {
+  let start = track.barRhythm.downbeatIndex;
+  while (
+    start + 4 <= track.barRhythm.onsetBodyBeatIndex &&
+    start + 4 < track.beatTimesSec.length
+  ) {
+    start += 4;
+  }
+  return start;
+}
 
 const INITIAL_TELEMETRY: PllTelemetry = {
   livePhaseErrorMs: 14.2,
@@ -156,6 +177,11 @@ export default function App() {
     [deck2.track, deck2Bpm, deck2AnchorMs]
   );
 
+  const deck1Ref = useRef<DeckUiInfo>(deck1);
+  deck1Ref.current = deck1;
+  const deck2Ref = useRef<DeckUiInfo>(deck2);
+  deck2Ref.current = deck2;
+
   const tracksRef = useRef<LoadedTracksRefPayload>({
     deck1: null,
     deck2: null,
@@ -165,6 +191,10 @@ export default function App() {
     deck2AnchorMs,
     deck1BeatTimes,
     deck2BeatTimes,
+    deck1StartBeat: 0,
+    deck2StartBeat: 0,
+    deck1TempoMult: 1,
+    deck2TempoMult: 1,
   });
 
   tracksRef.current = {
@@ -176,6 +206,10 @@ export default function App() {
     deck2AnchorMs,
     deck1BeatTimes,
     deck2BeatTimes,
+    deck1StartBeat: deck1.startBeatOffset,
+    deck2StartBeat: deck2.startBeatOffset,
+    deck1TempoMult: deck1.tempoMultiplier,
+    deck2TempoMult: deck2.tempoMultiplier,
   };
 
   const metrics = useMemo(() => computePhaseMetrics(state), [state]);
@@ -234,6 +268,10 @@ export default function App() {
               anchorMs: t.deck1AnchorMs,
               useBeatTimes: useTracked1,
               beatTimesSec: t.deck1BeatTimes,
+              startBeatOffset: deck1Ref.current.startBeatOffset,
+              tempoMultiplier: deck1Ref.current.tempoMultiplier,
+              keyLock: deck1Ref.current.keyLock,
+              keyShiftSemitones: deck1Ref.current.keyShiftSemitones,
             }
           : undefined,
         deck2Grid: t.deck2
@@ -242,6 +280,10 @@ export default function App() {
               anchorMs: t.deck2AnchorMs,
               useBeatTimes: useTracked2,
               beatTimesSec: t.deck2BeatTimes,
+              startBeatOffset: deck2Ref.current.startBeatOffset,
+              tempoMultiplier: deck2Ref.current.tempoMultiplier,
+              keyLock: deck2Ref.current.keyLock,
+              keyShiftSemitones: deck2Ref.current.keyShiftSemitones,
             }
           : undefined,
       };
@@ -282,9 +324,14 @@ export default function App() {
       const useTracked1 = Boolean(t.deck1 && (!t.deck1.isConstantTempo || curState.gridMode === 'dynamic'));
       const useTracked2 = Boolean(t.deck2 && (!t.deck2.isConstantTempo || curState.gridMode === 'dynamic'));
 
+      const deck1Start = deck1Ref.current.startBeatOffset;
+      const deck2Start = deck2Ref.current.startBeatOffset;
+      const deck1Mult = deck1Ref.current.tempoMultiplier;
+      const deck2Mult = deck2Ref.current.tempoMultiplier;
+
       const deck1OffsetSec = t.deck1
         ? getTimeAtBeatPosition(
-            curState.elapsedBeats,
+            curState.elapsedBeats * deck1Mult + deck1Start,
             useTracked1 ? t.deck1BeatTimes : [],
             d1Bpm,
             t.deck1AnchorMs
@@ -293,7 +340,7 @@ export default function App() {
 
       const deck2OffsetSec = t.deck2
         ? getTimeAtBeatPosition(
-            curState.elapsedBeats,
+            curState.elapsedBeats * deck2Mult + deck2Start,
             useTracked2 ? t.deck2BeatTimes : [],
             d2Bpm,
             t.deck2AnchorMs
@@ -308,8 +355,14 @@ export default function App() {
             curState.deck2BpmOffset +
             (curState.gridMode === 'dynamic' ? 0 : curState.deck2TrackDriftBpm);
 
-      const deck1Rate = curState.masterBpm / d1Bpm;
-      const deck2Rate = unroundedDeck2MasterBpm / d2Bpm;
+      const deck1Rate = (curState.masterBpm * deck1Mult) / d1Bpm;
+      const deck2Rate = (unroundedDeck2MasterBpm * deck2Mult) / d2Bpm;
+      const deck1DetuneCents =
+        deck1Ref.current.keyShiftSemitones * 100 -
+        (deck1Ref.current.keyLock ? 1200 * Math.log2(Math.max(0.25, deck1Rate)) : 0);
+      const deck2DetuneCents =
+        deck2Ref.current.keyShiftSemitones * 100 -
+        (deck2Ref.current.keyLock ? 1200 * Math.log2(Math.max(0.25, deck2Rate)) : 0);
 
       integralErrRef.current = 0;
 
@@ -318,6 +371,8 @@ export default function App() {
         deck2OffsetSec,
         deck1Rate,
         deck2Rate,
+        deck1DetuneCents,
+        deck2DetuneCents,
       });
     },
     [buildWorkletParams, crossfader]
@@ -570,90 +625,176 @@ export default function App() {
     deck2Bpm,
     deck1AnchorMs,
     deck2AnchorMs,
+    deck1.startBeatOffset,
+    deck1.tempoMultiplier,
+    deck1.keyLock,
+    deck1.keyShiftSemitones,
+    deck2.startBeatOffset,
+    deck2.tempoMultiplier,
+    deck2.keyLock,
+    deck2.keyShiftSemitones,
     autoNudgeEnabled,
     maxNudgeTrimPct,
     crossfader,
     audioEnabled,
   ]);
 
-  const handleLoadLocalFile = useCallback(async (deck: 1 | 2, file: File) => {
-    const setter = deck === 1 ? setDeck1 : setDeck2;
-    setter((prev) => ({ ...prev, loading: true, error: null }));
-    try {
-      const track = await audioEngine.loadLocalFile(deck, file);
-      setter({
-        track,
-        loading: false,
-        error: null,
-        manualBpm: null,
-        manualAnchorMs: track.firstTransientMs,
-      });
+  const applyTrackWithAutoRhythmMatch = useCallback(
+    (deck: 1 | 2, track: LoadedDeckTrack) => {
+      const soloStart = computeSoloStartBeat(track);
+      const otherDeck = deck === 1 ? deck2Ref.current : deck1Ref.current;
+
+      if (deck === 2 && otherDeck.track) {
+        const match = matchRhythmicStartingPoint(
+          otherDeck.track,
+          track,
+          otherDeck.startBeatOffset
+        );
+        const nextD2: DeckUiInfo = {
+          track,
+          loading: false,
+          error: null,
+          manualBpm: null,
+          manualAnchorMs: track.firstTransientMs,
+          startBeatOffset: match.startBeatOffset,
+          tempoMultiplier: match.tempoMultiplier,
+          rhythmMatchPct: match.matchScorePct,
+          keyLock: deck2Ref.current.keyLock,
+          keyShiftSemitones: 0,
+        };
+        deck2Ref.current = nextD2;
+        setDeck2(nextD2);
+        setDeck1((prev) => {
+          const nextD1 = { ...prev, rhythmMatchPct: match.matchScorePct };
+          deck1Ref.current = nextD1;
+          return nextD1;
+        });
+      } else if (deck === 1 && otherDeck.track) {
+        const match = matchRhythmicStartingPoint(track, otherDeck.track, soloStart);
+        const nextD1: DeckUiInfo = {
+          track,
+          loading: false,
+          error: null,
+          manualBpm: null,
+          manualAnchorMs: track.firstTransientMs,
+          startBeatOffset: soloStart,
+          tempoMultiplier: 1,
+          rhythmMatchPct: match.matchScorePct,
+          keyLock: deck1Ref.current.keyLock,
+          keyShiftSemitones: 0,
+        };
+        deck1Ref.current = nextD1;
+        setDeck1(nextD1);
+        setDeck2((prev) => {
+          const nextD2: DeckUiInfo = {
+            ...prev,
+            startBeatOffset: match.startBeatOffset,
+            tempoMultiplier: match.tempoMultiplier,
+            rhythmMatchPct: match.matchScorePct,
+          };
+          deck2Ref.current = nextD2;
+          return nextD2;
+        });
+      } else {
+        const setter = deck === 1 ? setDeck1 : setDeck2;
+        const ref = deck === 1 ? deck1Ref : deck2Ref;
+        const nextDeck: DeckUiInfo = {
+          track,
+          loading: false,
+          error: null,
+          manualBpm: null,
+          manualAnchorMs: track.firstTransientMs,
+          startBeatOffset: soloStart,
+          tempoMultiplier: 1,
+          rhythmMatchPct: null,
+          keyLock: ref.current.keyLock,
+          keyShiftSemitones: 0,
+        };
+        ref.current = nextDeck;
+        setter(nextDeck);
+      }
+    },
+    []
+  );
+
+  const handleLoadLocalFile = useCallback(
+    async (deck: 1 | 2, file: File) => {
+      const setter = deck === 1 ? setDeck1 : setDeck2;
+      setter((prev) => ({ ...prev, loading: true, error: null }));
+      try {
+        const track = await audioEngine.loadLocalFile(deck, file);
+        applyTrackWithAutoRhythmMatch(deck, track);
+
+        setState((prev) => {
+          const bothConstant =
+            (deck === 1 ? track.isConstantTempo : prev.gridMode === 'straight') &&
+            (deck === 2 ? track.isConstantTempo : prev.gridMode === 'straight');
+          const next: CalibrationState = {
+            ...prev,
+            masterBpm: deck === 1 ? track.exactBpm : prev.masterBpm,
+            gridOffsetMs: 0,
+            syncMode: 'beat',
+            quantize: true,
+            // Serato standard: Straight grid for quantized studio tracks, Dynamic only if live drift detected
+            gridMode: bothConstant ? 'straight' : 'dynamic',
+            elapsedBeats: 0,
+          };
+          stateRef.current = next;
+          return next;
+        });
+        setBarBeatDisplay('01.1.1');
+      } catch (err) {
+        setter((prev) => ({
+          ...prev,
+          loading: false,
+          error:
+            err instanceof Error
+              ? `Could not decode audio file: ${err.message}`
+              : 'Unsupported or corrupted audio file.',
+        }));
+      }
+    },
+    [applyTrackWithAutoRhythmMatch]
+  );
+
+  const handleLoadDemoTrack = useCallback(
+    (deck: 1 | 2) => {
+      const offsetMs = deck === 1 ? 0 : 14.2;
+      const track = audioEngine.loadDemoTrack(
+        deck,
+        124,
+        offsetMs,
+        deck === 1 ? 'Demo House Kick (124 BPM)' : 'Demo Groove Loop (+14.2 ms Pad)'
+      );
+      applyTrackWithAutoRhythmMatch(deck, track);
 
       setState((prev) => {
-        const bothConstant =
-          (deck === 1 ? track.isConstantTempo : prev.gridMode === 'straight') &&
-          (deck === 2 ? track.isConstantTempo : prev.gridMode === 'straight');
         const next: CalibrationState = {
           ...prev,
           masterBpm: deck === 1 ? track.exactBpm : prev.masterBpm,
-          gridOffsetMs: 0,
-          syncMode: 'beat',
-          quantize: true,
-          // Serato standard: Straight grid for quantized studio tracks, Dynamic only if live drift detected
-          gridMode: bothConstant ? 'straight' : 'dynamic',
+          gridOffsetMs: deck === 2 ? 14.2 : prev.gridOffsetMs,
+          gridMode: 'straight',
           elapsedBeats: 0,
         };
         stateRef.current = next;
         return next;
       });
       setBarBeatDisplay('01.1.1');
-    } catch (err) {
-      setter((prev) => ({
-        ...prev,
-        loading: false,
-        error:
-          err instanceof Error
-            ? `Could not decode audio file: ${err.message}`
-            : 'Unsupported or corrupted audio file.',
-      }));
-    }
-  }, []);
-
-  const handleLoadDemoTrack = useCallback((deck: 1 | 2) => {
-    const setter = deck === 1 ? setDeck1 : setDeck2;
-    const offsetMs = deck === 1 ? 0 : 14.2;
-    const track = audioEngine.loadDemoTrack(
-      deck,
-      124,
-      offsetMs,
-      deck === 1 ? 'Demo House Kick (124 BPM)' : 'Demo Groove Loop (+14.2 ms Pad)'
-    );
-    setter({
-      track,
-      loading: false,
-      error: null,
-      manualBpm: null,
-      manualAnchorMs: track.firstTransientMs,
-    });
-
-    setState((prev) => {
-      const next: CalibrationState = {
-        ...prev,
-        masterBpm: deck === 1 ? track.exactBpm : prev.masterBpm,
-        gridOffsetMs: deck === 2 ? 14.2 : prev.gridOffsetMs,
-        gridMode: 'straight',
-        elapsedBeats: 0,
-      };
-      stateRef.current = next;
-      return next;
-    });
-    setBarBeatDisplay('01.1.1');
-  }, []);
+    },
+    [applyTrackWithAutoRhythmMatch]
+  );
 
   const handleClearDeck = useCallback((deck: 1 | 2) => {
     audioEngine.clearDeck(deck);
-    if (deck === 1) setDeck1(EMPTY_DECK);
-    else setDeck2(EMPTY_DECK);
+    if (deck === 1) {
+      deck1Ref.current = EMPTY_DECK;
+      setDeck1(EMPTY_DECK);
+      setDeck2((prev) => ({ ...prev, rhythmMatchPct: null }));
+    } else {
+      deck2Ref.current = EMPTY_DECK;
+      setDeck2(EMPTY_DECK);
+      setDeck1((prev) => ({ ...prev, rhythmMatchPct: null }));
+    }
     setIsPlaying(false);
   }, []);
 
@@ -674,8 +815,85 @@ export default function App() {
     const setter = deck === 1 ? setDeck1 : setDeck2;
     setter((prev) => {
       const cur = prev.manualAnchorMs ?? prev.track?.firstTransientMs ?? 0;
-      const nextAnchor = Math.max(0, Number((cur + deltaMs).toFixed(1)));
+      const nextAnchor = Math.max(0, Number((cur + deltaMs).toFixed(2)));
       return { ...prev, manualAnchorMs: nextAnchor };
+    });
+  }, []);
+
+  const handleStartBeatSelect = useCallback((deck: 1 | 2, beatInBar: number) => {
+    const clampedBeat = ((Math.round(beatInBar) % 4) + 4) % 4;
+    const setter = deck === 1 ? setDeck1 : setDeck2;
+    const ref = deck === 1 ? deck1Ref : deck2Ref;
+    setter((prev) => {
+      if (!prev.track) return prev;
+      const baseBarOffset = Math.floor(prev.startBeatOffset / 4) * 4;
+      const candidate = baseBarOffset + clampedBeat;
+      const nextStart = candidate < prev.track.beatTimesSec.length ? candidate : clampedBeat;
+      const next = { ...prev, startBeatOffset: nextStart };
+      ref.current = next;
+      return next;
+    });
+  }, []);
+
+  const handleAutoMatchRhythm = useCallback((deck: 1 | 2) => {
+    const self = deck === 1 ? deck1Ref.current : deck2Ref.current;
+    const opp = deck === 1 ? deck2Ref.current : deck1Ref.current;
+    if (!self.track || !opp.track) return;
+    const match = matchRhythmicStartingPoint(opp.track, self.track, opp.startBeatOffset);
+    const setter = deck === 1 ? setDeck1 : setDeck2;
+    const selfRef = deck === 1 ? deck1Ref : deck2Ref;
+    setter((prev) => {
+      const next: DeckUiInfo = {
+        ...prev,
+        startBeatOffset: match.startBeatOffset,
+        tempoMultiplier: match.tempoMultiplier,
+        rhythmMatchPct: match.matchScorePct,
+      };
+      selfRef.current = next;
+      return next;
+    });
+    const oppSetter = deck === 1 ? setDeck2 : setDeck1;
+    const oppRef = deck === 1 ? deck2Ref : deck1Ref;
+    oppSetter((prev) => {
+      const next = { ...prev, rhythmMatchPct: match.matchScorePct };
+      oppRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const handleToggleKeyLock = useCallback((deck: 1 | 2) => {
+    const setter = deck === 1 ? setDeck1 : setDeck2;
+    const ref = deck === 1 ? deck1Ref : deck2Ref;
+    setter((prev) => {
+      const next = { ...prev, keyLock: !prev.keyLock };
+      ref.current = next;
+      return next;
+    });
+  }, []);
+
+  const handleKeyShiftChange = useCallback((deck: 1 | 2, semitones: number) => {
+    const clamped = Math.max(-12, Math.min(12, Math.round(semitones)));
+    const setter = deck === 1 ? setDeck1 : setDeck2;
+    const ref = deck === 1 ? deck1Ref : deck2Ref;
+    setter((prev) => {
+      const next = { ...prev, keyShiftSemitones: clamped };
+      ref.current = next;
+      return next;
+    });
+  }, []);
+
+  const handleMatchKeyToOpposite = useCallback((deck: 1 | 2) => {
+    const self = deck === 1 ? deck1Ref.current : deck2Ref.current;
+    const opp = deck === 1 ? deck2Ref.current : deck1Ref.current;
+    if (!self.track || !opp.track) return;
+    const oppSoundingKey = transposeKeyInfo(opp.track.musicalKey, opp.keyShiftSemitones);
+    const shift = findOptimalSemitoneMatch(self.track.musicalKey, oppSoundingKey);
+    const setter = deck === 1 ? setDeck1 : setDeck2;
+    const ref = deck === 1 ? deck1Ref : deck2Ref;
+    setter((prev) => {
+      const next = { ...prev, keyShiftSemitones: shift };
+      ref.current = next;
+      return next;
     });
   }, []);
 
@@ -921,6 +1139,11 @@ export default function App() {
             onClearDeck={handleClearDeck}
             onManualBpmChange={handleManualBpmChange}
             onManualAnchorShift={handleManualAnchorShift}
+            onStartBeatSelect={handleStartBeatSelect}
+            onAutoMatchRhythm={handleAutoMatchRhythm}
+            onToggleKeyLock={handleToggleKeyLock}
+            onKeyShiftChange={handleKeyShiftChange}
+            onMatchKeyToOpposite={handleMatchKeyToOpposite}
             onCrossfaderChange={handleCrossfaderChange}
             onApplyDetectedTransientOffset={handleSnapToZero}
           />

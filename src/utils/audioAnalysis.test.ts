@@ -1,12 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  analyzeBarRhythm,
   analyzeBeatGrid,
   computeWaveformPeaks,
   detectFirstTransientMs,
+  detectMusicalKey,
   estimateBpm,
+  findOptimalSemitoneMatch,
   generateTestAudioPcm,
+  matchRhythmicStartingPoint,
   sampleTrackPeak,
+  transposeKeyInfo,
 } from './audioAnalysis';
 
 test('detectFirstTransientMs finds kick onset within <= 0.20 ms on clean and +18 ms padded audio', () => {
@@ -200,4 +205,92 @@ test('analyzeBeatGrid switches to dynamic beat tracking for subtle 0.12 BPM drif
   }
   const grid = analyzeBeatGrid(pcm, sr);
   assert.equal(grid.isConstantTempo, false, 'Expected dynamic beatgrid mode for 0.12 BPM drift');
+});
+
+test('matchRhythmicStartingPoint achieves 100% Beat-1 alignment across all 4 cyclic bar shifts ([1,2,3,4], [2,3,4,1], [3,4,1,2], [4,1,2,3])', () => {
+  const sr = 44100;
+  const masterPcm = generateTestAudioPcm(126, 12, sr, 0, 'master', { beatShift: 0 });
+  const masterGrid = analyzeBeatGrid(masterPcm, sr);
+
+  const cases = [
+    { beatShift: 0, expectedStart: 0 },
+    { beatShift: 1, expectedStart: 3 },
+    { beatShift: 2, expectedStart: 2 },
+    { beatShift: 3, expectedStart: 1 },
+  ];
+
+  for (const { beatShift, expectedStart } of cases) {
+    const incomingPcm = generateTestAudioPcm(124, 12, sr, 12.5, 'incoming', { beatShift });
+    const incomingGrid = analyzeBeatGrid(incomingPcm, sr);
+    const match = matchRhythmicStartingPoint(masterGrid, incomingGrid, 0);
+
+    assert.equal(
+      match.startBeatOffset % 4,
+      expectedStart,
+      `Expected bar startBeatOffset ${expectedStart} for beatShift=${beatShift}, got ${match.startBeatOffset}`
+    );
+    assert.equal(
+      match.matchScorePct,
+      100,
+      `Expected 100% rhythmic bar match for beatShift=${beatShift}, got ${match.matchScorePct}%`
+    );
+    assert.equal(match.tempoMultiplier, 1);
+  }
+});
+
+test('analyzeBarRhythm skips sparse intro pickup beats and locks onto true full-body Beat 1', () => {
+  const sr = 44100;
+  const bpm = 128;
+  const beatSec = 60 / bpm;
+  const full = generateTestAudioPcm(bpm, 12, sr, 0, 'master', { beatShift: 0 });
+  // Attenuate bar 1 (beats 0..3) to a light 48% intro groove so beatgrid starts at beat 0,
+  // while full-body groove drops at beat 4 (Bar 2 Beat 1)
+  const barEndSample = Math.floor(4 * beatSec * sr);
+  for (let i = 0; i < barEndSample; i++) {
+    full[i] *= 0.48;
+  }
+  const grid = analyzeBeatGrid(full, sr);
+  const bar = analyzeBarRhythm(full, sr, grid.beatTimesSec);
+  assert.ok(bar.onsetBodyBeatIndex >= 4, `Expected body onset >= beat 4, got ${bar.onsetBodyBeatIndex}`);
+  const match = matchRhythmicStartingPoint(grid, grid, 0);
+  assert.equal(match.startBeatOffset % 4, 0);
+  assert.ok(match.startBeatOffset >= 4, `Expected full-body startBeatOffset >= 4, got ${match.startBeatOffset}`);
+});
+
+test('matchRhythmicStartingPoint selects 0.5x and 2x tempo families for half/double-BPM opposite decks', () => {
+  const sr = 22050;
+  const track140 = analyzeBeatGrid(generateTestAudioPcm(140, 10, sr, 0, 'master'), sr);
+  const track70 = analyzeBeatGrid(generateTestAudioPcm(72, 10, sr, 0, 'incoming'), sr);
+
+  const matchHalf = matchRhythmicStartingPoint(track140, track70, 0);
+  assert.equal(matchHalf.tempoMultiplier, 0.5, 'Expected 0.5x half-time when target is ~72 vs 140 BPM');
+
+  const matchDouble = matchRhythmicStartingPoint(track70, track140, 0);
+  assert.equal(matchDouble.tempoMultiplier, 2, 'Expected 2x double-time when target is 140 vs ~72 BPM');
+});
+
+test('detectMusicalKey identifies Am (8A), C (8B), Dm (7A) and findOptimalSemitoneMatch computes exact harmonic transpose', () => {
+  const sr = 44100;
+  const pcmAm = generateTestAudioPcm(124, 8, sr, 0, 'master', { rootMidi: 57, mode: 'minor' });
+  const pcmC = generateTestAudioPcm(124, 8, sr, 0, 'incoming', { rootMidi: 60, mode: 'major' });
+  const pcmDm = generateTestAudioPcm(124, 8, sr, 0, 'incoming', { rootMidi: 62, mode: 'minor' });
+
+  const keyAm = detectMusicalKey(pcmAm, sr);
+  const keyC = detectMusicalKey(pcmC, sr);
+  const keyDm = detectMusicalKey(pcmDm, sr);
+
+  assert.equal(keyAm.label, 'Am');
+  assert.equal(keyAm.camelot, '8A');
+  assert.equal(keyC.label, 'C');
+  assert.equal(keyC.camelot, '8B');
+  assert.equal(keyDm.label, 'Dm');
+  assert.equal(keyDm.camelot, '7A');
+
+  // Relative major/minor (C 8B -> Am 8A) is already Camelot #8 compatible (0 semitones)
+  assert.equal(findOptimalSemitoneMatch(keyC, keyAm), 0);
+  // Dm (7A) shifted down -5 semitones lands on Am (8A)
+  const shiftDmToAm = findOptimalSemitoneMatch(keyDm, keyAm);
+  assert.equal(shiftDmToAm, -5);
+  assert.equal(transposeKeyInfo(keyDm, shiftDmToAm).label, 'Am');
+  assert.equal(transposeKeyInfo(keyDm, shiftDmToAm).camelot, '8A');
 });

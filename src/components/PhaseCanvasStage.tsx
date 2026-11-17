@@ -19,6 +19,10 @@ export interface LoadedTracksRefPayload {
   deck2AnchorMs: number;
   deck1BeatTimes: number[];
   deck2BeatTimes: number[];
+  deck1StartBeat?: number;
+  deck2StartBeat?: number;
+  deck1TempoMult?: 0.5 | 1 | 2;
+  deck2TempoMult?: 0.5 | 1 | 2;
 }
 
 interface PhaseCanvasStageProps {
@@ -290,8 +294,10 @@ export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = ({
         let sample: number;
         if (tracks.deck1 && tracks.deck1.peaks.length > 0) {
           const d1BeatSec = 60 / Math.max(40, tracks.deck1Bpm);
+          const d1Beat =
+            beatAtX * (tracks.deck1TempoMult ?? 1) + (tracks.deck1StartBeat ?? 0);
           const trackTimeSec =
-            (((beatAtX * d1BeatSec + tracks.deck1AnchorMs / 1000) % tracks.deck1.durationSec) +
+            (((d1Beat * d1BeatSec + tracks.deck1AnchorMs / 1000) % tracks.deck1.durationSec) +
               tracks.deck1.durationSec) %
             tracks.deck1.durationSec;
           sample = sampleTrackPeak(
@@ -326,8 +332,10 @@ export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = ({
         let sample: number;
         if (tracks.deck2 && tracks.deck2.peaks.length > 0) {
           const d2BeatSec = 60 / Math.max(40, tracks.deck2Bpm);
+          const d2Beat =
+            beatAtX * (tracks.deck2TempoMult ?? 1) + (tracks.deck2StartBeat ?? 0);
           const trackTimeSec =
-            (((beatAtX * d2BeatSec + tracks.deck2AnchorMs / 1000) % tracks.deck2.durationSec) +
+            (((d2Beat * d2BeatSec + tracks.deck2AnchorMs / 1000) % tracks.deck2.durationSec) +
               tracks.deck2.durationSec) %
             tracks.deck2.durationSec;
           sample = sampleTrackPeak(

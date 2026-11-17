@@ -1,5 +1,6 @@
 import React, { useRef, useState } from 'react';
-import { Music, Trash2, Upload } from 'lucide-react';
+import { Lock, Music, Trash2, Unlock, Upload } from 'lucide-react';
+import { type MusicalKeyInfo, transposeKeyInfo } from '../utils/audioAnalysis';
 import { type LoadedDeckTrack } from '../utils/audioEngine';
 
 export interface DeckUiInfo {
@@ -8,6 +9,11 @@ export interface DeckUiInfo {
   error: string | null;
   manualBpm: number | null;
   manualAnchorMs: number | null;
+  startBeatOffset: number;
+  tempoMultiplier: 0.5 | 1 | 2;
+  rhythmMatchPct: number | null;
+  keyLock: boolean;
+  keyShiftSemitones: number;
 }
 
 interface DeckLoaderPanelProps {
@@ -32,6 +38,11 @@ interface DeckLoaderPanelProps {
   onClearDeck: (deck: 1 | 2) => void;
   onManualBpmChange: (deck: 1 | 2, bpm: number) => void;
   onManualAnchorShift: (deck: 1 | 2, deltaMs: number) => void;
+  onStartBeatSelect: (deck: 1 | 2, beatInBar: number) => void;
+  onAutoMatchRhythm: (deck: 1 | 2) => void;
+  onToggleKeyLock: (deck: 1 | 2) => void;
+  onKeyShiftChange: (deck: 1 | 2, semitones: number) => void;
+  onMatchKeyToOpposite: (deck: 1 | 2) => void;
   onCrossfaderChange: (val: number) => void;
   onApplyDetectedTransientOffset: () => void;
 }
@@ -69,11 +80,9 @@ const SeratoPlatter: React.FC<SeratoPlatterProps> = ({
         style={{ borderColor: accentHex }}
         aria-hidden="true"
       >
-        {/* Outer vinyl groove rings */}
         <div className="absolute inset-1.5 rounded-full border border-slate-700/60" />
         <div className="absolute inset-3 rounded-full border border-slate-800/80" />
 
-        {/* Rotating Serato position marker needle */}
         <div
           className="absolute inset-0"
           style={{
@@ -87,7 +96,6 @@ const SeratoPlatter: React.FC<SeratoPlatterProps> = ({
           />
         </div>
 
-        {/* Center label */}
         <div className="relative z-10 w-10 h-10 rounded-full bg-[#151A24] border border-slate-700 flex flex-col items-center justify-center">
           <span className="text-[9px] font-mono font-semibold text-slate-400 leading-none">
             D{deckNum}
@@ -117,6 +125,8 @@ interface SingleDeckCardProps {
   accentHex: string;
   accentText: string;
   info: DeckUiInfo;
+  oppositeKey: MusicalKeyInfo | null;
+  hasOppositeTrack: boolean;
   isSynced?: boolean;
   isPlaying: boolean;
   elapsedBeats: number;
@@ -130,6 +140,11 @@ interface SingleDeckCardProps {
   onClear: () => void;
   onBpmChange: (bpm: number) => void;
   onAnchorShift: (deltaMs: number) => void;
+  onStartBeatSelect: (beatInBar: number) => void;
+  onAutoMatchRhythm: () => void;
+  onToggleKeyLock: () => void;
+  onKeyShiftChange: (semitones: number) => void;
+  onMatchKeyToOpposite: () => void;
   onApplyDetectedTransient?: () => void;
 }
 
@@ -139,6 +154,8 @@ const SingleDeckCard: React.FC<SingleDeckCardProps> = ({
   accentHex,
   accentText,
   info,
+  oppositeKey,
+  hasOppositeTrack,
   isSynced,
   isPlaying,
   elapsedBeats,
@@ -152,6 +169,11 @@ const SingleDeckCard: React.FC<SingleDeckCardProps> = ({
   onClear,
   onBpmChange,
   onAnchorShift,
+  onStartBeatSelect,
+  onAutoMatchRhythm,
+  onToggleKeyLock,
+  onKeyShiftChange,
+  onMatchKeyToOpposite,
   onApplyDetectedTransient,
 }) => {
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -160,6 +182,14 @@ const SingleDeckCard: React.FC<SingleDeckCardProps> = ({
 
   const activeBpm = info.manualBpm ?? info.track?.detectedBpm ?? 124;
   const activeAnchorMs = info.manualAnchorMs ?? info.track?.firstTransientMs ?? 0;
+  const effectiveKey = info.track
+    ? transposeKeyInfo(info.track.musicalKey, info.keyShiftSemitones)
+    : null;
+  const selectedBeatInBar = ((info.startBeatOffset % 4) + 4) % 4;
+  const isKeyMatchedToOpposite =
+    effectiveKey &&
+    oppositeKey &&
+    Number.parseInt(effectiveKey.camelot, 10) === Number.parseInt(oppositeKey.camelot, 10);
 
   const handleFiles = (files: FileList | null) => {
     if (!files || files.length === 0) return;
@@ -354,7 +384,7 @@ const SingleDeckCard: React.FC<SingleDeckCardProps> = ({
 
       {info.loading && (
         <div className="border border-[#262E3F] rounded-lg px-4 py-3.5 text-xs font-medium text-slate-300 bg-[#0D1017]">
-          Analyzing low-band kick transients &amp; Serato beatgrid...
+          Analyzing beatgrid, bar downbeat, &amp; musical key...
         </div>
       )}
 
@@ -438,7 +468,10 @@ const SingleDeckCard: React.FC<SingleDeckCardProps> = ({
           {/* Serato Beatgrid Anchor Edit Strip */}
           <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-[#1D2330] text-xs">
             <span className="font-mono tabular-nums text-slate-400">
-              Beat 1 Anchor: <strong className="text-white" data-testid={`deck-${deckNum}-anchor-ms`}>{activeAnchorMs.toFixed(2)} ms</strong>
+              Beat 1 Anchor:{' '}
+              <strong className="text-white" data-testid={`deck-${deckNum}-anchor-ms`}>
+                {activeAnchorMs.toFixed(2)} ms
+              </strong>
             </span>
             <div className="flex items-center gap-1">
               <button
@@ -480,6 +513,157 @@ const SingleDeckCard: React.FC<SingleDeckCardProps> = ({
               )}
             </div>
           </div>
+
+          {/* Rhythmic Starting Point & Bar Downbeat Alignment Strip */}
+          <div
+            className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-[#1D2330] text-xs"
+            data-testid={`deck-${deckNum}-rhythm-strip`}
+          >
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="font-mono text-slate-400">Bar Start:</span>
+              <div
+                className="inline-flex items-center gap-0.5 bg-[#12161F] p-0.5 rounded border border-[#242C3D]"
+                role="group"
+                aria-label={`Deck ${deckNum} bar starting beat`}
+              >
+                {[0, 1, 2, 3].map((bIdx) => (
+                  <button
+                    key={bIdx}
+                    type="button"
+                    onClick={() => onStartBeatSelect(bIdx)}
+                    aria-pressed={selectedBeatInBar === bIdx}
+                    data-testid={`deck-${deckNum}-start-b${bIdx + 1}`}
+                    className={`px-2 py-0.5 text-[11px] font-mono font-semibold rounded transition-colors cursor-pointer ${
+                      selectedBeatInBar === bIdx
+                        ? 'bg-sky-600 text-white'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    B{bIdx + 1}
+                  </button>
+                ))}
+              </div>
+              {info.tempoMultiplier !== 1 && (
+                <span
+                  className="px-1.5 py-0.5 text-[11px] font-mono font-semibold text-amber-300 bg-amber-500/15 border border-amber-500/30 rounded"
+                  data-testid={`deck-${deckNum}-tempo-family`}
+                >
+                  {info.tempoMultiplier === 0.5 ? '0.5× Half' : '2× Double'}
+                </span>
+              )}
+            </div>
+
+            <div className="flex items-center gap-1.5">
+              {hasOppositeTrack && info.rhythmMatchPct !== null && (
+                <span
+                  className={`font-mono font-semibold ${
+                    info.rhythmMatchPct >= 95 ? 'text-emerald-400' : 'text-amber-300'
+                  }`}
+                  data-testid={`deck-${deckNum}-match-pct`}
+                >
+                  {info.rhythmMatchPct}% Bar Match
+                </span>
+              )}
+              {hasOppositeTrack && (
+                <button
+                  type="button"
+                  onClick={onAutoMatchRhythm}
+                  data-testid={`deck-${deckNum}-auto-match-rhythm`}
+                  className="px-2 py-0.5 text-[11px] font-semibold bg-[#181E2A] hover:bg-[#232B3B] border border-[#2B3446] text-sky-300 rounded whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Auto Start
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Musical Key Lock & Semitone Key Adjuster Strip */}
+          <div
+            className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-[#1D2330] text-xs"
+            data-testid={`deck-${deckNum}-key-strip`}
+          >
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={onToggleKeyLock}
+                aria-pressed={info.keyLock}
+                data-testid={`deck-${deckNum}-keylock`}
+                title="Toggle Phase-Locked Key Lock (preserves musical key cleanly across BPM changes)"
+                className={`inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-mono font-semibold rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  info.keyLock
+                    ? 'bg-emerald-600/20 border-emerald-500/50 text-emerald-300 hover:bg-emerald-600/30'
+                    : 'bg-[#181E2A] border-[#2B3446] text-slate-400 hover:text-white'
+                }`}
+              >
+                {info.keyLock ? <Lock className="w-3 h-3" /> : <Unlock className="w-3 h-3" />}
+                <span>{info.keyLock ? 'KEY LOCK' : 'KEY FREE'}</span>
+              </button>
+
+              {effectiveKey && (
+                <span
+                  className="font-mono tabular-nums font-semibold text-white whitespace-nowrap"
+                  data-testid={`deck-${deckNum}-key-display`}
+                >
+                  {effectiveKey.label} · {effectiveKey.camelot}
+                  {info.keyShiftSemitones !== 0 && (
+                    <span className="ml-1 text-sky-400">
+                      ({info.keyShiftSemitones > 0 ? '+' : ''}
+                      {info.keyShiftSemitones} st)
+                    </span>
+                  )}
+                </span>
+              )}
+            </div>
+
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => onKeyShiftChange(Math.max(-12, info.keyShiftSemitones - 1))}
+                disabled={info.keyShiftSemitones <= -12}
+                data-testid={`deck-${deckNum}-key-down`}
+                title="Transpose key down 1 semitone"
+                className="px-2 py-0.5 font-mono bg-[#181E2A] border border-[#2B3446] hover:bg-[#222A3A] rounded text-slate-200 cursor-pointer disabled:opacity-40"
+              >
+                -1 st
+              </button>
+              <button
+                type="button"
+                onClick={() => onKeyShiftChange(0)}
+                disabled={info.keyShiftSemitones === 0}
+                data-testid={`deck-${deckNum}-key-reset`}
+                title="Reset key shift to original 0 semitones"
+                className="px-1.5 py-0.5 font-mono bg-[#181E2A] border border-[#2B3446] hover:bg-[#222A3A] rounded text-slate-300 cursor-pointer disabled:opacity-40"
+              >
+                0
+              </button>
+              <button
+                type="button"
+                onClick={() => onKeyShiftChange(Math.min(12, info.keyShiftSemitones + 1))}
+                disabled={info.keyShiftSemitones >= 12}
+                data-testid={`deck-${deckNum}-key-up`}
+                title="Transpose key up 1 semitone"
+                className="px-2 py-0.5 font-mono bg-[#181E2A] border border-[#2B3446] hover:bg-[#222A3A] rounded text-slate-200 cursor-pointer disabled:opacity-40"
+              >
+                +1 st
+              </button>
+
+              {oppositeKey && (
+                <button
+                  type="button"
+                  onClick={onMatchKeyToOpposite}
+                  data-testid={`deck-${deckNum}-key-match`}
+                  title={`Harmonically transpose Deck ${deckNum} to match ${oppositeKey.label} (${oppositeKey.camelot})`}
+                  className={`ml-1 px-2 py-0.5 text-[11px] font-semibold rounded border whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                    isKeyMatchedToOpposite
+                      ? 'bg-emerald-600/20 border-emerald-500/40 text-emerald-300'
+                      : 'bg-sky-600 hover:bg-sky-500 border-sky-500 text-white'
+                  }`}
+                >
+                  {isKeyMatchedToOpposite ? 'Key Matched' : 'Match Key'}
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       )}
 
@@ -514,16 +698,30 @@ export const DeckLoaderPanel: React.FC<DeckLoaderPanelProps> = ({
   onClearDeck,
   onManualBpmChange,
   onManualAnchorShift,
+  onStartBeatSelect,
+  onAutoMatchRhythm,
+  onToggleKeyLock,
+  onKeyShiftChange,
+  onMatchKeyToOpposite,
   onCrossfaderChange,
   onApplyDetectedTransientOffset,
 }) => {
   const deck1TrimLabel = deck1.track
-    ? `Native ${deck1.track.exactBpm.toFixed(2)} BPM`
+    ? `Native ${deck1.track.exactBpm.toFixed(2)} BPM · ${
+        transposeKeyInfo(deck1.track.musicalKey, deck1.keyShiftSemitones).label
+      }`
     : 'Reference Clock';
   const trimSign = deck2RateTrimPct > 0 ? '+' : '';
   const deck2TrimLabel = `Trim ${trimSign}${deck2RateTrimPct.toFixed(2)}% · Err ${
     livePhaseErrorMs > 0 ? '+' : ''
   }${livePhaseErrorMs.toFixed(2)} ms`;
+
+  const d1EffectiveKey = deck1.track
+    ? transposeKeyInfo(deck1.track.musicalKey, deck1.keyShiftSemitones)
+    : null;
+  const d2EffectiveKey = deck2.track
+    ? transposeKeyInfo(deck2.track.musicalKey, deck2.keyShiftSemitones)
+    : null;
 
   return (
     <section aria-label="Serato-style dual virtual decks and mixer" className="mb-5">
@@ -534,15 +732,22 @@ export const DeckLoaderPanel: React.FC<DeckLoaderPanelProps> = ({
           accentHex="#38BDF8"
           accentText="text-sky-400"
           info={deck1}
+          oppositeKey={d2EffectiveKey}
+          hasOppositeTrack={Boolean(deck2.track)}
           isPlaying={isPlaying}
-          elapsedBeats={elapsedBeats}
-          displayedBpm={masterBpm}
+          elapsedBeats={elapsedBeats * deck1.tempoMultiplier}
+          displayedBpm={masterBpm * deck1.tempoMultiplier}
           trimLabel={deck1TrimLabel}
           onLoadFile={(file) => onLoadFile(1, file)}
           onLoadDemo={() => onLoadDemo(1)}
           onClear={() => onClearDeck(1)}
           onBpmChange={(bpm) => onManualBpmChange(1, bpm)}
           onAnchorShift={(delta) => onManualAnchorShift(1, delta)}
+          onStartBeatSelect={(beatIdx) => onStartBeatSelect(1, beatIdx)}
+          onAutoMatchRhythm={() => onAutoMatchRhythm(1)}
+          onToggleKeyLock={() => onToggleKeyLock(1)}
+          onKeyShiftChange={(st) => onKeyShiftChange(1, st)}
+          onMatchKeyToOpposite={() => onMatchKeyToOpposite(1)}
         />
 
         <SingleDeckCard
@@ -551,10 +756,12 @@ export const DeckLoaderPanel: React.FC<DeckLoaderPanelProps> = ({
           accentHex={isSynced ? '#10B981' : '#F59E0B'}
           accentText={isSynced ? 'text-emerald-400' : 'text-amber-400'}
           info={deck2}
+          oppositeKey={d1EffectiveKey}
+          hasOppositeTrack={Boolean(deck1.track)}
           isSynced={isSynced}
           isPlaying={isPlaying}
-          elapsedBeats={elapsedBeats}
-          displayedBpm={masterBpm * (1 + deck2RateTrimPct / 100)}
+          elapsedBeats={elapsedBeats * deck2.tempoMultiplier}
+          displayedBpm={masterBpm * deck2.tempoMultiplier * (1 + deck2RateTrimPct / 100)}
           trimLabel={deck2TrimLabel}
           onToggleSync={onToggleSync}
           onManualPhaseNudge={onManualPhaseNudge}
@@ -564,6 +771,11 @@ export const DeckLoaderPanel: React.FC<DeckLoaderPanelProps> = ({
           onClear={() => onClearDeck(2)}
           onBpmChange={(bpm) => onManualBpmChange(2, bpm)}
           onAnchorShift={(delta) => onManualAnchorShift(2, delta)}
+          onStartBeatSelect={(beatIdx) => onStartBeatSelect(2, beatIdx)}
+          onAutoMatchRhythm={() => onAutoMatchRhythm(2)}
+          onToggleKeyLock={() => onToggleKeyLock(2)}
+          onKeyShiftChange={(st) => onKeyShiftChange(2, st)}
+          onMatchKeyToOpposite={() => onMatchKeyToOpposite(2)}
           onApplyDetectedTransient={onApplyDetectedTransientOffset}
         />
       </div>

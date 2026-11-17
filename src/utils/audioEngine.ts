@@ -36,12 +36,20 @@ export interface WorkletParamsPayload {
     anchorMs: number;
     useBeatTimes: boolean;
     beatTimesSec?: number[];
+    startBeatOffset?: number;
+    tempoMultiplier?: 0.5 | 1 | 2;
+    keyLock?: boolean;
+    keyShiftSemitones?: number;
   };
   deck2Grid?: {
     bpm: number;
     anchorMs: number;
     useBeatTimes: boolean;
     beatTimesSec?: number[];
+    startBeatOffset?: number;
+    tempoMultiplier?: 0.5 | 1 | 2;
+    keyLock?: boolean;
+    keyShiftSemitones?: number;
   };
 }
 
@@ -113,7 +121,7 @@ class DualDeckAudioEngine {
 
     this.workletLoadPromise = (async () => {
       try {
-        await ctx.audioWorklet.addModule('/phasezero-worklet.js');
+        await ctx.audioWorklet.addModule('/phasezero-worklet.js?v=2');
         const node = new AudioWorkletNode(ctx, 'phasezero-worklet-processor', {
           numberOfInputs: 0,
           numberOfOutputs: 1,
@@ -303,6 +311,8 @@ class DualDeckAudioEngine {
       beatTimesSec: grid.beatTimesSec,
       isConstantTempo: grid.isConstantTempo,
       gridResidualMs: grid.gridResidualMs,
+      barRhythm: grid.barRhythm,
+      musicalKey: grid.musicalKey,
       peaks,
       peakSamplesPerSec,
       buffer: audioBuffer,
@@ -321,7 +331,12 @@ class DualDeckAudioEngine {
     deck: 1 | 2,
     bpm = 124,
     initialOffsetMs = 0,
-    label?: string
+    label?: string,
+    options?: {
+      beatShift?: number;
+      rootMidi?: number;
+      mode?: 'major' | 'minor';
+    }
   ): LoadedDeckTrack {
     const ctx = this.ensureContext();
     const sampleRate = ctx ? ctx.sampleRate : 44100;
@@ -331,7 +346,12 @@ class DualDeckAudioEngine {
       durationSec,
       sampleRate,
       initialOffsetMs,
-      deck === 1 ? 'master' : 'incoming'
+      deck === 1 ? 'master' : 'incoming',
+      options ?? {
+        beatShift: 0,
+        rootMidi: deck === 1 ? 57 : 62, // Deck 1: Am (8A), Deck 2: Dm (7A)
+        mode: 'minor',
+      }
     );
 
     let buffer: AudioBuffer;
@@ -365,6 +385,8 @@ class DualDeckAudioEngine {
       beatTimesSec: grid.beatTimesSec,
       isConstantTempo: grid.isConstantTempo,
       gridResidualMs: grid.gridResidualMs,
+      barRhythm: grid.barRhythm,
+      musicalKey: grid.musicalKey,
       peaks,
       peakSamplesPerSec,
       buffer,
@@ -432,6 +454,8 @@ class DualDeckAudioEngine {
     deck2OffsetSec: number;
     deck1Rate: number;
     deck2Rate: number;
+    deck1DetuneCents?: number;
+    deck2DetuneCents?: number;
   }): void {
     if (!this.enabled || !this.ctx || !this.deck1Gain || !this.deck2Gain) return;
     if (this.ctx.state === 'suspended') {
@@ -452,6 +476,9 @@ class DualDeckAudioEngine {
       src1.buffer = this.deck1Track.buffer;
       src1.loop = true;
       src1.playbackRate.setValueAtTime(rate1, start1);
+      if (typeof params.deck1DetuneCents === 'number') {
+        src1.detune.setValueAtTime(params.deck1DetuneCents, start1);
+      }
       src1.connect(this.deck1Gain);
       src1.start(start1, offset1);
       this.deck1Source = src1;
@@ -476,6 +503,9 @@ class DualDeckAudioEngine {
       src2.buffer = this.deck2Track.buffer;
       src2.loop = true;
       src2.playbackRate.setValueAtTime(rate2, start2);
+      if (typeof params.deck2DetuneCents === 'number') {
+        src2.detune.setValueAtTime(params.deck2DetuneCents, start2);
+      }
       src2.connect(this.deck2Gain);
       src2.start(start2, offset2);
       this.deck2Source = src2;

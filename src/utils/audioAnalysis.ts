@@ -1,3 +1,26 @@
+export interface MusicalKeyInfo {
+  keyIndex: number; // 0=C, 1=C#, ... 11=B
+  mode: 'major' | 'minor';
+  label: string; // e.g. 'Am', 'C', 'F#m'
+  camelot: string; // e.g. '8A', '8B'
+  confidence: number; // 0..1
+}
+
+export interface BarRhythmProfile {
+  downbeatIndex: number; // 0..3 beat index within detected 4-beat bar corresponding to Bar 1 Beat 1
+  downbeatMs: number;
+  kickBarEnergy: [number, number, number, number]; // Normalized low-band kick energy per beat [0..3]
+  snareBarEnergy: [number, number, number, number]; // Normalized mid/high-band backbeat energy per beat [0..3]
+  onsetBodyBeatIndex: number; // First beat index where full rhythmic groove stabilizes
+}
+
+export interface RhythmicStartMatch {
+  startBeatOffset: number; // Beat offset in target track that aligns 100% onto reference Beat 1
+  anchorMs: number;
+  tempoMultiplier: 0.5 | 1 | 2;
+  matchScorePct: number;
+}
+
 export interface AnalyzedTrackData {
   name: string;
   durationSec: number;
@@ -8,6 +31,8 @@ export interface AnalyzedTrackData {
   beatTimesSec: number[];
   isConstantTempo: boolean;
   gridResidualMs: number;
+  barRhythm: BarRhythmProfile;
+  musicalKey: MusicalKeyInfo;
   peaks: Float32Array;
   peakSamplesPerSec: number;
 }
@@ -480,9 +505,19 @@ export function analyzeBeatGrid(
   beatTimesSec: number[];
   isConstantTempo: boolean;
   gridResidualMs: number;
+  barRhythm: BarRhythmProfile;
+  musicalKey: MusicalKeyInfo;
 } {
   const durationSec = sampleRate > 0 ? samples.length / sampleRate : 0;
   const fallbackTransientMs = detectFirstTransientMs(samples, sampleRate);
+  const musicalKey = detectMusicalKey(samples, sampleRate);
+  const defaultBarRhythm: BarRhythmProfile = {
+    downbeatIndex: 0,
+    downbeatMs: fallbackTransientMs,
+    kickBarEnergy: [0.25, 0.25, 0.25, 0.25],
+    snareBarEnergy: [0.1, 0.4, 0.1, 0.4],
+    onsetBodyBeatIndex: 0,
+  };
 
   if (samples.length < sampleRate * 0.9 || sampleRate <= 0) {
     return {
@@ -492,6 +527,8 @@ export function analyzeBeatGrid(
       beatTimesSec: [fallbackTransientMs / 1000],
       isConstantTempo: true,
       gridResidualMs: 0,
+      barRhythm: defaultBarRhythm,
+      musicalKey,
     };
   }
 
@@ -530,6 +567,8 @@ export function analyzeBeatGrid(
       beatTimesSec: [fallbackTransientMs / 1000],
       isConstantTempo: true,
       gridResidualMs: 0,
+      barRhythm: defaultBarRhythm,
+      musicalKey,
     };
   }
 
@@ -554,11 +593,14 @@ export function analyzeBeatGrid(
   let bestCombScore = 0;
   for (let lag = minLag; lag <= maxLag; lag++) {
     const s1 = acfScore(lag);
-    const s2 = lag * 2 < frameCount ? acfScore(lag * 2) * 0.75 : 0;
-    const s4 = lag * 4 < frameCount ? acfScore(lag * 4) * 0.5 : 0;
+    const s2 = lag * 2 < frameCount ? acfScore(lag * 2) : 0;
+    const s4 = lag * 4 < frameCount ? acfScore(lag * 4) : 0;
+    // Require genuine beat-to-beat kick energy (s1) so 2x phantom sub-lags cannot hijack 70-88 BPM tracks
+    const h2 = Math.min(s1 * 1.25, s2) * 0.75;
+    const h4 = Math.min(s1 * 1.25, s4) * 0.5;
     const candidateBpm = (60 * envRate) / lag;
-    const octaveBias = candidateBpm >= 90 && candidateBpm <= 155 ? 1.12 : 0.94;
-    const sc = (s1 + s2 + s4) * octaveBias;
+    const octaveBias = candidateBpm >= 90 && candidateBpm <= 155 ? 1.12 : 0.96;
+    const sc = (s1 + h2 + h4) * octaveBias;
     combScores[lag] = sc;
     if (sc > bestCombScore) bestCombScore = sc;
   }
@@ -571,6 +613,8 @@ export function analyzeBeatGrid(
       beatTimesSec: [fallbackTransientMs / 1000],
       isConstantTempo: true,
       gridResidualMs: 0,
+      barRhythm: defaultBarRhythm,
+      musicalKey,
     };
   }
 
@@ -741,8 +785,14 @@ export function analyzeBeatGrid(
         (p) => Math.abs(p.timeSec - (r1.intercept + p.beatIdx * r1.slope)) <= 0.012
       ).length;
       const candBpmFromReg = 60 / r1.slope;
-      const octavePref = candBpmFromReg >= 90 && candBpmFromReg <= 155 ? 2 : 0;
-      const fitScore = inlierCnt - r1.residualMs * 2.5 + octavePref - cIdx * 0.25;
+      const spanSec = Math.max(0.5, initEndSample / sampleRate - candStartSec);
+      const expectedBeats = Math.max(1, Math.floor(spanSec / r1.slope) + 1);
+      const missedBeats = Math.max(0, expectedBeats - inlierCnt);
+      const hitRatio = inlierCnt / expectedBeats;
+      const octavePref =
+        hitRatio >= 0.7 && candBpmFromReg >= 90 && candBpmFromReg <= 155 ? 0.5 : 0;
+      const fitScore =
+        inlierCnt - missedBeats * 0.55 - r1.residualMs * 2.5 + octavePref - cIdx * 0.25;
       if (fitScore > bestCandidateFit) {
         bestCandidateFit = fitScore;
         reg = r1;
@@ -940,6 +990,8 @@ export function analyzeBeatGrid(
     beatTimesSec.push(Number(anchorSec.toFixed(6)));
   }
 
+  const barRhythm = analyzeBarRhythmFromLow(trackSlice, lowFull, sampleRate, beatTimesSec);
+
   return {
     bpm: displayBpm,
     exactBpm,
@@ -947,6 +999,440 @@ export function analyzeBeatGrid(
     beatTimesSec,
     isConstantTempo,
     gridResidualMs,
+    barRhythm,
+    musicalKey,
+  };
+}
+
+const NOTE_NAMES_SHARP = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B'] as const;
+const MAJOR_CAMELOT_BY_PC = ['8B', '3B', '10B', '5B', '12B', '7B', '2B', '9B', '4B', '11B', '6B', '1B'] as const;
+const MINOR_CAMELOT_BY_PC = ['5A', '12A', '7A', '2A', '9A', '4A', '11A', '6A', '1A', '8A', '3A', '10A'] as const;
+// Krumhansl-Schmuckler tonal pitch-class profiles
+const KS_MAJOR_PROFILE = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+const KS_MINOR_PROFILE = [6.33, 2.68, 3.52, 5.38, 2.6, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+
+export function formatMusicalKeyInfo(
+  keyIndex: number,
+  mode: 'major' | 'minor',
+  confidence = 1
+): MusicalKeyInfo {
+  const pc = ((Math.round(keyIndex) % 12) + 12) % 12;
+  const note = NOTE_NAMES_SHARP[pc];
+  return {
+    keyIndex: pc,
+    mode,
+    label: mode === 'minor' ? `${note}m` : note,
+    camelot: mode === 'minor' ? MINOR_CAMELOT_BY_PC[pc] : MAJOR_CAMELOT_BY_PC[pc],
+    confidence: Number(Math.max(0, Math.min(1, confidence)).toFixed(2)),
+  };
+}
+
+export function transposeKeyInfo(key: MusicalKeyInfo, semitones: number): MusicalKeyInfo {
+  return formatMusicalKeyInfo(key.keyIndex + Math.round(semitones), key.mode, key.confidence);
+}
+
+/**
+ * Computes the shortest semitone shift [-6..+6] on sourceKey to harmonically match targetKey's Camelot tonic.
+ */
+export function findOptimalSemitoneMatch(
+  sourceKey: MusicalKeyInfo,
+  targetKey: MusicalKeyInfo
+): number {
+  const targetNum = Number.parseInt(targetKey.camelot, 10);
+  const targetTonePc =
+    sourceKey.mode === targetKey.mode
+      ? targetKey.keyIndex
+      : sourceKey.mode === 'minor'
+        ? (targetKey.keyIndex + 9) % 12
+        : (targetKey.keyIndex + 3) % 12;
+  if (Number.isFinite(targetNum)) {
+    const srcNum = Number.parseInt(sourceKey.camelot, 10);
+    if (srcNum === targetNum) return 0;
+  }
+  let delta = (((targetTonePc - sourceKey.keyIndex) % 12) + 12) % 12;
+  if (delta > 6) delta -= 12;
+  return delta;
+}
+
+/**
+ * Krumhansl-Schmuckler Goertzel chroma detector across octaves C2..B5.
+ */
+export function detectMusicalKey(samples: Float32Array, sampleRate: number): MusicalKeyInfo {
+  if (samples.length < 2048 || sampleRate < 4000) {
+    return formatMusicalKeyInfo(9, 'minor', 0);
+  }
+
+  const chroma = new Float64Array(12);
+  const N = Math.min(4096, Math.pow(2, Math.floor(Math.log2(samples.length))));
+  const hann = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    hann[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (N - 1)));
+  }
+
+  // Sample up to 14 evenly-spaced frames across active audio (skip quiet leading 5% if long)
+  const startOffset = samples.length > sampleRate * 8 ? Math.floor(sampleRate * 0.5) : 0;
+  const usableLen = samples.length - startOffset;
+  const frameCount = Math.min(14, Math.max(1, Math.floor(usableLen / N)));
+  const hop = frameCount > 1 ? Math.floor((usableLen - N) / (frameCount - 1)) : 0;
+
+  // MIDI pitches 36 (C2 ~65.4Hz) through 83 (B5 ~987.8Hz)
+  const minMidi = 36;
+  const maxMidi = 83;
+  const coeffs: { pc: number; coeff: number }[] = [];
+  for (let m = minMidi; m <= maxMidi; m++) {
+    const freq = 440 * Math.pow(2, (m - 69) / 12);
+    if (freq < sampleRate * 0.42) {
+      const k = (N * freq) / sampleRate;
+      const omega = (2 * Math.PI * k) / N;
+      coeffs.push({ pc: m % 12, coeff: 2 * Math.cos(omega) });
+    }
+  }
+
+  let framesUsed = 0;
+  const windowed = new Float32Array(N);
+  for (let f = 0; f < frameCount; f++) {
+    const s0 = startOffset + f * hop;
+    if (s0 + N > samples.length) break;
+    let frameEnergy = 0;
+    for (let i = 0; i < N; i++) {
+      const v = samples[s0 + i] * hann[i];
+      windowed[i] = v;
+      frameEnergy += v * v;
+    }
+    if (frameEnergy < 1e-5) continue;
+
+    for (let c = 0; c < coeffs.length; c++) {
+      const { pc, coeff } = coeffs[c];
+      let q1 = 0;
+      let q2 = 0;
+      for (let i = 0; i < N; i++) {
+        const q0 = coeff * q1 - q2 + windowed[i];
+        q2 = q1;
+        q1 = q0;
+      }
+      const magSq = Math.max(0, q1 * q1 + q2 * q2 - q1 * q2 * coeff);
+      chroma[pc] += Math.sqrt(magSq);
+    }
+    framesUsed++;
+  }
+
+  if (framesUsed === 0) {
+    return formatMusicalKeyInfo(9, 'minor', 0);
+  }
+
+  const correlate = (profile: number[], root: number): number => {
+    let meanX = 0;
+    let meanY = 0;
+    for (let i = 0; i < 12; i++) {
+      meanX += chroma[(root + i) % 12];
+      meanY += profile[i];
+    }
+    meanX /= 12;
+    meanY /= 12;
+    let num = 0;
+    let denX = 0;
+    let denY = 0;
+    for (let i = 0; i < 12; i++) {
+      const dx = chroma[(root + i) % 12] - meanX;
+      const dy = profile[i] - meanY;
+      num += dx * dy;
+      denX += dx * dx;
+      denY += dy * dy;
+    }
+    const den = Math.sqrt(denX * denY);
+    return den > 1e-9 ? num / den : 0;
+  };
+
+  let bestPc = 9;
+  let bestMode: 'major' | 'minor' = 'minor';
+  let bestScore = -Infinity;
+  let secondScore = -Infinity;
+
+  for (let pc = 0; pc < 12; pc++) {
+    const maj = correlate(KS_MAJOR_PROFILE, pc);
+    if (maj > bestScore) {
+      secondScore = bestScore;
+      bestScore = maj;
+      bestPc = pc;
+      bestMode = 'major';
+    } else if (maj > secondScore) {
+      secondScore = maj;
+    }
+
+    const min = correlate(KS_MINOR_PROFILE, pc);
+    if (min > bestScore) {
+      secondScore = bestScore;
+      bestScore = min;
+      bestPc = pc;
+      bestMode = 'minor';
+    } else if (min > secondScore) {
+      secondScore = min;
+    }
+  }
+
+  const conf = Math.max(0.1, Math.min(1, bestScore * 0.7 + Math.max(0, bestScore - secondScore)));
+  return formatMusicalKeyInfo(bestPc, bestMode, conf);
+}
+
+/**
+ * Analyzes per-beat <165 Hz kick energy and >165 Hz backbeat clap/snare energy across the 4-beat bar cycle
+ * so shifted loops ([2,3,4,1]), pickup intros, and full grooves identify Bar 1 Beat 1 reliably.
+ */
+function analyzeBarRhythmFromLow(
+  trackSlice: Float32Array,
+  lowFull: Float32Array,
+  sampleRate: number,
+  beatTimesSec: number[]
+): BarRhythmProfile {
+  const kickAccum = [0, 0, 0, 0];
+  const snareAccum = [0, 0, 0, 0];
+  const beatCounts = [0, 0, 0, 0];
+  const beatTotalEnergy: number[] = [];
+  const winLen = Math.max(16, Math.floor(sampleRate * 0.055));
+  const snareWinLen = Math.max(12, Math.floor(sampleRate * 0.032));
+  const prePad = Math.floor(sampleRate * 0.005);
+  const maxBeats = Math.min(beatTimesSec.length, 64);
+
+  // Isolate > 750 Hz clap/snare transient crack (zero kick-sweep bleed)
+  const analyzeEnd = Math.min(
+    trackSlice.length,
+    Math.ceil(((beatTimesSec[maxBeats - 1] ?? 0) + 0.1) * sampleRate)
+  );
+  const lowMid = zeroPhaseLowPassFilter(
+    trackSlice.subarray(0, analyzeEnd),
+    sampleRate,
+    Math.min(750, sampleRate * 0.42)
+  );
+
+  for (let b = 0; b < maxBeats; b++) {
+    const s0 = Math.max(0, Math.round(beatTimesSec[b] * sampleRate) - prePad);
+    const s1 = Math.min(trackSlice.length, s0 + winLen);
+    const sSnareEnd = Math.min(lowMid.length, s0 + prePad + snareWinLen);
+    if (s1 <= s0) {
+      beatTotalEnergy.push(0);
+      continue;
+    }
+    let kSq = 0;
+    for (let i = s0; i < s1; i++) {
+      const l = lowFull[i];
+      kSq += l * l;
+    }
+    let hSq = 0;
+    for (let i = s0; i < sSnareEnd; i++) {
+      const h = trackSlice[i] - lowMid[i];
+      hSq += h * h;
+    }
+    const kRms = Math.sqrt(kSq / (s1 - s0));
+    const hRms = Math.sqrt(hSq / Math.max(1, sSnareEnd - s0));
+    const beatInBar = b % 4;
+    kickAccum[beatInBar] += kRms;
+    snareAccum[beatInBar] += hRms;
+    beatCounts[beatInBar]++;
+    beatTotalEnergy.push(kRms + hRms);
+  }
+
+  for (let b = 0; b < 4; b++) {
+    if (beatCounts[b] > 0) {
+      kickAccum[b] /= beatCounts[b];
+      snareAccum[b] /= beatCounts[b];
+    }
+  }
+
+  let onsetBodyBeatIndex = 0;
+  if (beatTotalEnergy.length >= 8) {
+    // Require sustained 4-beat bar energy so a lone intro hit + sparse beats skips to full groove entry
+    const barEnergies: number[] = [];
+    for (let b = 0; b + 3 < beatTotalEnergy.length; b++) {
+      barEnergies.push(
+        (beatTotalEnergy[b] +
+          beatTotalEnergy[b + 1] +
+          beatTotalEnergy[b + 2] +
+          beatTotalEnergy[b + 3]) /
+          4
+      );
+    }
+    const sortedBars = [...barEnergies].sort((a, b) => a - b);
+    const refBar = sortedBars[Math.floor(sortedBars.length * 0.75)];
+    for (let b = 0; b < barEnergies.length; b++) {
+      if (barEnergies[b] >= refBar * 0.72 && beatTotalEnergy[b] >= refBar * 0.72) {
+        onsetBodyBeatIndex = b;
+        break;
+      }
+    }
+  } else if (beatTotalEnergy.length >= 4) {
+    const sorted = [...beatTotalEnergy].sort((a, b) => a - b);
+    const refEnergy = sorted[Math.floor(sorted.length * 0.65)];
+    for (let b = 0; b < beatTotalEnergy.length; b++) {
+      if (beatTotalEnergy[b] >= refEnergy * 0.55) {
+        onsetBodyBeatIndex = b;
+        break;
+      }
+    }
+  }
+
+  const normalize4 = (arr: number[]): [number, number, number, number] => {
+    const sum = arr[0] + arr[1] + arr[2] + arr[3];
+    if (sum <= 1e-9) return [0.25, 0.25, 0.25, 0.25];
+    return [
+      Number((arr[0] / sum).toFixed(4)),
+      Number((arr[1] / sum).toFixed(4)),
+      Number((arr[2] / sum).toFixed(4)),
+      Number((arr[3] / sum).toFixed(4)),
+    ];
+  };
+
+  const kickBarEnergy = normalize4(kickAccum);
+  const snareBarEnergy = normalize4(snareAccum);
+
+  let bestDownbeat = 0;
+  let bestScore = -Infinity;
+  for (let c = 0; c < 4; c++) {
+    const backbeatSnare = snareBarEnergy[(c + 1) % 4] + snareBarEnergy[(c + 3) % 4];
+    const onbeatSnare = snareBarEnergy[c] + snareBarEnergy[(c + 2) % 4];
+    const downbeatKick = kickBarEnergy[c] * 1.4 + kickBarEnergy[(c + 2) % 4] * 0.6;
+    const bodyTie = c === onsetBodyBeatIndex % 4 ? 0.002 : 0;
+    const score =
+      2.2 * (backbeatSnare - onbeatSnare) +
+      1.6 * downbeatKick +
+      bodyTie -
+      c * 1e-4;
+    if (score > bestScore) {
+      bestScore = score;
+      bestDownbeat = c;
+    }
+  }
+
+  // Advance by whole 4-beat bars if intro pickup beat had sparse energy before full body entry
+  let startIdx = bestDownbeat;
+  while (startIdx + 4 <= onsetBodyBeatIndex && startIdx + 4 < beatTimesSec.length) {
+    startIdx += 4;
+  }
+
+  const downbeatSec =
+    startIdx < beatTimesSec.length ? beatTimesSec[startIdx] : beatTimesSec[0] ?? 0;
+
+  return {
+    downbeatIndex: bestDownbeat,
+    downbeatMs: Number((downbeatSec * 1000).toFixed(2)),
+    kickBarEnergy,
+    snareBarEnergy,
+    onsetBodyBeatIndex,
+  };
+}
+
+export function analyzeBarRhythm(
+  samples: Float32Array,
+  sampleRate: number,
+  beatTimesSec: number[]
+): BarRhythmProfile {
+  const lowFull = zeroPhaseLowPassFilter(samples, sampleRate, 165);
+  return analyzeBarRhythmFromLow(samples, lowFull, sampleRate, beatTimesSec);
+}
+
+/**
+ * Chooses the optimal rhythmic starting beat offset (0..totalBeats-1) and tempo-family
+ * multiplier (0.5x | 1x | 2x) on `target` so its 4-beat groove locks 100% onto `reference`.
+ */
+export function matchRhythmicStartingPoint(
+  reference: Pick<AnalyzedTrackData, 'exactBpm' | 'firstTransientMs' | 'beatTimesSec' | 'barRhythm'>,
+  target: Pick<AnalyzedTrackData, 'exactBpm' | 'firstTransientMs' | 'beatTimesSec' | 'barRhythm'>,
+  referenceStartBeatOffset = 0
+): RhythmicStartMatch {
+  // 1. Choose tempo-family multiplier r in {0.5, 1, 2} so (refBpm * r) ~ targetBpm
+  const candidatesR: readonly (0.5 | 1 | 2)[] = [1, 0.5, 2];
+  let tempoMultiplier: 0.5 | 1 | 2 = 1;
+  let bestLogDist = Infinity;
+  for (const r of candidatesR) {
+    const effectiveTargetRefBpm = reference.exactBpm * r;
+    const dist = Math.abs(Math.log2(Math.max(1, effectiveTargetRefBpm) / Math.max(1, target.exactBpm)));
+    const penalty = r === 1 ? 0 : 0.22;
+    if (dist + penalty < bestLogDist) {
+      bestLogDist = dist + penalty;
+      tempoMultiplier = r;
+    }
+  }
+
+  const refShift = ((Math.round(referenceStartBeatOffset) % 4) + 4) % 4;
+  const refK = [0, 1, 2, 3].map((m) => reference.barRhythm.kickBarEnergy[(refShift + m) % 4]);
+  const refS = [0, 1, 2, 3].map((m) => reference.barRhythm.snareBarEnergy[(refShift + m) % 4]);
+
+  const shapeSimilarity = (a: number[], b: number[]): number => {
+    let meanA = 0;
+    let meanB = 0;
+    let dotRaw = 0;
+    let naRaw = 0;
+    let nbRaw = 0;
+    for (let i = 0; i < a.length; i++) {
+      meanA += a[i];
+      meanB += b[i];
+      dotRaw += a[i] * b[i];
+      naRaw += a[i] * a[i];
+      nbRaw += b[i] * b[i];
+    }
+    meanA /= a.length;
+    meanB /= b.length;
+    const denRaw = Math.sqrt(naRaw * nbRaw);
+    const cosRaw = denRaw > 1e-9 ? dotRaw / denRaw : 1;
+
+    let dotC = 0;
+    let naC = 0;
+    let nbC = 0;
+    for (let i = 0; i < a.length; i++) {
+      const da = a[i] - meanA;
+      const db = b[i] - meanB;
+      dotC += da * db;
+      naC += da * da;
+      nbC += db * db;
+    }
+    const denC = Math.sqrt(naC * nbC);
+    const corrC = denC > 1e-7 ? (dotC / denC + 1) * 0.5 : 1;
+    return 0.4 * cosRaw + 0.6 * corrC;
+  };
+
+  let bestShift = 0;
+  let bestCombined = -Infinity;
+  let bestSim = 1;
+
+  for (let s = 0; s < 4; s++) {
+    const tgtK = [0, 1, 2, 3].map((m) => target.barRhythm.kickBarEnergy[(s + m) % 4]);
+    const tgtS = [0, 1, 2, 3].map((m) => target.barRhythm.snareBarEnergy[(s + m) % 4]);
+    const kickSim = shapeSimilarity(refK, tgtK);
+    const snareSim = shapeSimilarity(refS, tgtS);
+    const hasSnareContrast =
+      Math.max(...refS) - Math.min(...refS) > 0.04 &&
+      Math.max(...tgtS) - Math.min(...tgtS) > 0.04;
+    const avgSim = hasSnareContrast ? 0.45 * kickSim + 0.55 * snareSim : kickSim;
+    const downbeatTie = s === target.barRhythm.downbeatIndex ? 0.002 : 0;
+    const combined = avgSim + downbeatTie - s * 1e-4;
+    if (combined > bestCombined) {
+      bestCombined = combined;
+      bestShift = s;
+      bestSim = avgSim;
+    }
+  }
+
+  let startBeatOffset = bestShift;
+  while (
+    startBeatOffset + 4 <= target.barRhythm.onsetBodyBeatIndex &&
+    startBeatOffset + 4 < target.beatTimesSec.length
+  ) {
+    startBeatOffset += 4;
+  }
+
+  const beatSec = 60 / Math.max(40, target.exactBpm);
+  const anchorSec =
+    startBeatOffset < target.beatTimesSec.length
+      ? target.beatTimesSec[startBeatOffset]
+      : target.firstTransientMs / 1000 + startBeatOffset * beatSec;
+
+  const matchScorePct =
+    bestSim >= 0.92 ? 100 : Math.round(Math.max(0, Math.min(1, bestSim / 0.92)) * 100);
+
+  return {
+    startBeatOffset,
+    anchorMs: Number((anchorSec * 1000).toFixed(2)),
+    tempoMultiplier,
+    matchScorePct,
   };
 }
 
@@ -959,12 +1445,21 @@ export function generateTestAudioPcm(
   durationSec: number,
   sampleRate: number,
   initialOffsetMs = 0,
-  variant: 'master' | 'incoming' = 'master'
+  variant: 'master' | 'incoming' = 'master',
+  options?: {
+    beatShift?: number; // e.g., 1 opens recording on Beat 2 ([2,3,4,1] shifted loop!)
+    rootMidi?: number; // optional harmonic synth triad for musical key detection tests (e.g. 57 = Am, 60 = C)
+    mode?: 'major' | 'minor';
+  }
 ): Float32Array {
   const totalSamples = Math.floor(durationSec * sampleRate);
   const out = new Float32Array(totalSamples);
   const beatSec = 60 / bpm;
   const offsetSec = initialOffsetMs / 1000;
+  const beatShift = Math.floor(options?.beatShift ?? 0);
+  const rootMidi = options?.rootMidi ?? (variant === 'master' ? 57 : 60); // Am (8A) vs C (8B)
+  const chordMode = options?.mode ?? (variant === 'master' ? 'minor' : 'major');
+  const chordIntervals = chordMode === 'minor' ? [0, 3, 7] : [0, 4, 7];
 
   for (let i = 0; i < totalSamples; i++) {
     const t = i / sampleRate - offsetSec;
@@ -972,18 +1467,19 @@ export function generateTestAudioPcm(
 
     const beatPos = t / beatSec;
     const frac = beatPos - Math.floor(beatPos);
-    const beatInBar = Math.floor(beatPos) % 4;
+    const beatInBar = (((Math.floor(beatPos) + beatShift) % 4) + 4) % 4;
     let val = 0;
 
-    // Kick drum on every quarter beat
+    // Kick drum on every quarter beat with stronger downbeat on Beat 1 (beatInBar === 0)
     const kickTime = frac * beatSec;
     if (kickTime < 0.14) {
       const env = Math.exp(-kickTime * 28);
+      const kickAccent = beatInBar === 0 ? 1.0 : beatInBar === 2 ? 0.86 : 0.78;
       const pitchSweep =
         variant === 'master'
           ? 54 + 130 * Math.exp(-kickTime * 45)
           : 58 + 145 * Math.exp(-kickTime * 48);
-      val += Math.sin(2 * Math.PI * pitchSweep * kickTime) * env * 0.72;
+      val += Math.sin(2 * Math.PI * pitchSweep * kickTime) * env * 0.72 * kickAccent;
     }
 
     // Off-beat open/closed hat at 0.5 beat
@@ -1003,6 +1499,16 @@ export function generateTestAudioPcm(
       const clapTone =
         Math.sin(2 * Math.PI * 1450 * kickTime) * Math.sin(2 * Math.PI * 390 * kickTime);
       val += clapTone * clapEnv * 0.22;
+    }
+
+    // Subtle harmonic synth stab in mid frequencies (>180 Hz so kick detection stays unaffected)
+    if (frac >= 0.06 && frac < 0.45) {
+      const stabEnv = Math.exp(-(frac - 0.06) * 10) * 0.045;
+      for (let c = 0; c < chordIntervals.length; c++) {
+        const midi = rootMidi + chordIntervals[c];
+        const freq = 440 * Math.pow(2, (midi - 69) / 12);
+        val += Math.sin(2 * Math.PI * freq * t) * stabEnv;
+      }
     }
 
     out[i] = Math.max(-0.98, Math.min(0.98, val));
