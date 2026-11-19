@@ -1,10 +1,11 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { memo, useEffect, useRef, useState } from 'react';
 import { Lock, Repeat, Trash2, Unlock, Upload, Volume2, VolumeX } from 'lucide-react';
 import { type MusicalKeyInfo, sampleTrackPeak, transposeKeyInfo } from '../utils/audioAnalysis';
 import {
   audioEngine,
   computeDetectedLoopBeats,
   type LoadedDeckTrack,
+  type LooperBlendMode,
 } from '../utils/audioEngine';
 
 export interface LooperUiInfo {
@@ -21,6 +22,7 @@ export interface LooperUiInfo {
   active: boolean;
   gain: number;
   loopBeatsOverride: number; // 0 = Auto (detected bars)
+  blendMode: LooperBlendMode;
 }
 
 interface AudioLooperSlotProps {
@@ -36,6 +38,7 @@ interface AudioLooperSlotProps {
   onClear: () => void;
   onToggleActive: () => void;
   onGainChange: (gain: number) => void;
+  onBlendModeChange: (mode: LooperBlendMode) => void;
   onBpmChange: (bpm: number) => void;
   onAnchorShift: (deltaMs: number) => void;
   onLoopBeatsChange: (beats: number) => void;
@@ -54,7 +57,30 @@ const LOOP_LENGTH_OPTIONS: Array<{ beats: number; label: string }> = [
   { beats: 32, label: '32b' },
 ];
 
-export const AudioLooperSlot: React.FC<AudioLooperSlotProps> = ({
+const BLEND_MODE_OPTIONS: Array<{ mode: LooperBlendMode; label: string; title: string }> = [
+  {
+    mode: 'auto',
+    label: 'Auto Blend',
+    title: 'Auto-clears sub-bass clash (<135 Hz) when mixing with a song; full range solo',
+  },
+  {
+    mode: 'blend-140',
+    label: 'Bass Swap',
+    title: '140 Hz DJ bass-swap high-pass filter so the song kick stays punchy',
+  },
+  {
+    mode: 'top-260',
+    label: 'Tops 260Hz',
+    title: '260 Hz high-pass isolates tops, hats, claps & vocal chops cleanly',
+  },
+  {
+    mode: 'full',
+    label: 'Full',
+    title: 'Full-frequency loop playback (no low-cut filter)',
+  },
+];
+
+export const AudioLooperSlot: React.FC<AudioLooperSlotProps> = memo(({
   looper,
   masterBpm,
   masterDeckLabel,
@@ -67,6 +93,7 @@ export const AudioLooperSlot: React.FC<AudioLooperSlotProps> = ({
   onClear,
   onToggleActive,
   onGainChange,
+  onBlendModeChange,
   onBpmChange,
   onAnchorShift,
   onLoopBeatsChange,
@@ -78,6 +105,7 @@ export const AudioLooperSlot: React.FC<AudioLooperSlotProps> = ({
 }) => {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const canvasSizeRef = useRef<{ width: number; height: number }>({ width: 640, height: 56 });
   const beatCounterRef = useRef<HTMLSpanElement | null>(null);
   const [dragOver, setDragOver] = useState(false);
 
@@ -110,6 +138,17 @@ export const AudioLooperSlot: React.FC<AudioLooperSlotProps> = ({
     let rafId = 0;
     let disposed = false;
 
+    const el = canvasRef.current;
+    if (el) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        canvasSizeRef.current = {
+          width: Math.max(240, Math.floor(rect.width)),
+          height: Math.max(52, Math.floor(rect.height)),
+        };
+      }
+    }
+
     const drawLoopWave = () => {
       if (disposed) return;
       const canvas = canvasRef.current;
@@ -119,9 +158,8 @@ export const AudioLooperSlot: React.FC<AudioLooperSlotProps> = ({
       if (!ctx) return;
 
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      const rect = canvas.getBoundingClientRect();
-      const width = Math.max(240, Math.floor(rect.width));
-      const height = Math.max(52, Math.floor(rect.height));
+      const width = canvasSizeRef.current.width;
+      const height = canvasSizeRef.current.height;
 
       if (canvas.width !== width * dpr || canvas.height !== height * dpr) {
         canvas.width = width * dpr;
@@ -227,10 +265,16 @@ export const AudioLooperSlot: React.FC<AudioLooperSlotProps> = ({
     };
 
     drawLoopWave();
-    const el = canvasRef.current;
     let observer: ResizeObserver | null = null;
     if (el && typeof ResizeObserver !== 'undefined') {
-      observer = new ResizeObserver(() => {
+      observer = new ResizeObserver((entries) => {
+        const entry = entries[0];
+        if (entry && entry.contentRect.width > 0 && entry.contentRect.height > 0) {
+          canvasSizeRef.current = {
+            width: Math.max(240, Math.floor(entry.contentRect.width)),
+            height: Math.max(52, Math.floor(entry.contentRect.height)),
+          };
+        }
         if (!isPlaying) drawLoopWave();
       });
       observer.observe(el);
@@ -682,6 +726,53 @@ export const AudioLooperSlot: React.FC<AudioLooperSlotProps> = ({
               )}
             </div>
           </div>
+
+          {/* Acoustic Song Blend EQ Strip */}
+          <div
+            className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-[#1D2330] text-xs"
+            data-testid="looper-blend-strip"
+          >
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="font-mono text-slate-400">Song Blend EQ:</span>
+              <div
+                className="inline-flex items-center gap-0.5 bg-[#12161F] p-0.5 rounded border border-[#242C3D]"
+                role="group"
+                aria-label="Looper acoustic blend EQ mode"
+                data-testid="looper-blend-mode"
+              >
+                {BLEND_MODE_OPTIONS.map((opt) => {
+                  const selected = looper.blendMode === opt.mode;
+                  return (
+                    <button
+                      key={opt.mode}
+                      type="button"
+                      title={opt.title}
+                      onClick={() => onBlendModeChange(opt.mode)}
+                      aria-pressed={selected}
+                      data-testid={`looper-blend-${opt.mode}`}
+                      className={`px-2 py-0.5 text-[11px] font-mono font-semibold rounded transition-colors cursor-pointer whitespace-nowrap ${
+                        selected
+                          ? 'bg-emerald-600 text-white'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <span className="text-[11px] font-mono text-slate-400">
+              {looper.blendMode === 'auto'
+                ? 'Auto sub-bass crossover + soft limiter prevents mud & clipping'
+                : looper.blendMode === 'blend-140'
+                  ? '140 Hz Bass-Swap active (song kick leads)'
+                  : looper.blendMode === 'top-260'
+                    ? '260 Hz Tops/Percussion Blend active'
+                    : 'Full-range output (no low-cut)'}
+            </span>
+          </div>
         </div>
       )}
 
@@ -692,4 +783,4 @@ export const AudioLooperSlot: React.FC<AudioLooperSlotProps> = ({
       )}
     </section>
   );
-};
+});

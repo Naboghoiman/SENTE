@@ -15,6 +15,7 @@ import {
   audioEngine,
   computeDetectedLoopBeats,
   type LoadedDeckTrack,
+  type LooperBlendMode,
   type WorkletParamsPayload,
 } from './utils/audioEngine';
 import {
@@ -65,6 +66,7 @@ const EMPTY_LOOPER: LooperUiInfo = {
   active: true,
   gain: 0.85,
   loopBeatsOverride: 0,
+  blendMode: 'auto',
 };
 
 function computeSoloStartBeat(track: LoadedDeckTrack): number {
@@ -150,9 +152,25 @@ function deriveStaticTelemetry(
   };
 }
 
+function telemetryEquals(a: PllTelemetry, b: PllTelemetry): boolean {
+  return (
+    a.livePhaseErrorMs === b.livePhaseErrorMs &&
+    a.rateTrimPct === b.rateTrimPct &&
+    a.peakDriftMs === b.peakDriftMs &&
+    a.hardSnapCount === b.hardSnapCount &&
+    a.correctionState === b.correctionState &&
+    a.activeLoopMode === b.activeLoopMode &&
+    a.maxTrimPct === b.maxTrimPct
+  );
+}
+
 export default function App() {
   const [state, setState] = useState<CalibrationState>(INITIAL_STATE);
-  const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const [deck1Playing, setDeck1Playing] = useState<boolean>(false);
+  const [deck2Playing, setDeck2Playing] = useState<boolean>(false);
+  const [looperPlaying, setLooperPlaying] = useState<boolean>(false);
+  const isPlaying = deck1Playing || deck2Playing || looperPlaying;
+
   const [audioEnabled, setAudioEnabled] = useState<boolean>(false);
   const [barBeatDisplay, setBarBeatDisplay] = useState<string>('01.1.1');
   const [completedSteps, setCompletedSteps] = useState<Record<string, boolean>>({});
@@ -168,7 +186,20 @@ export default function App() {
   const stateRef = useRef<CalibrationState>(INITIAL_STATE);
   stateRef.current = state;
   const elapsedBeatsRef = useRef<number>(INITIAL_STATE.elapsedBeats);
-  elapsedBeatsRef.current = state.elapsedBeats;
+  if (!isPlaying) {
+    elapsedBeatsRef.current = state.elapsedBeats;
+  }
+
+  const deck1PlayingRef = useRef<boolean>(false);
+  deck1PlayingRef.current = deck1Playing;
+  const deck2PlayingRef = useRef<boolean>(false);
+  deck2PlayingRef.current = deck2Playing;
+  const looperPlayingRef = useRef<boolean>(false);
+  looperPlayingRef.current = looperPlaying;
+  const isPlayingRef = useRef<boolean>(false);
+  isPlayingRef.current = isPlaying;
+  const audioEnabledRef = useRef<boolean>(false);
+  audioEnabledRef.current = audioEnabled;
 
   const autoNudgeRef = useRef<boolean>(true);
   autoNudgeRef.current = autoNudgeEnabled;
@@ -232,6 +263,8 @@ export default function App() {
     looperTempoMult: 1,
     looperLoopBeats: 16,
     looperActive: true,
+    deck1Playing: false,
+    deck2Playing: false,
   });
 
   tracksRef.current = {
@@ -254,12 +287,14 @@ export default function App() {
     looperTempoMult: looper.tempoMultiplier,
     looperLoopBeats: looperEffectiveLoopBeats,
     looperActive: looper.active,
+    deck1Playing,
+    deck2Playing,
   };
 
   const metrics = useMemo(() => computePhaseMetrics(state), [state]);
   const isSynced = state.syncMode === 'beat' && metrics.absErrorMs === 0;
   const hasDualTracksPlaying =
-    isPlaying && audioEnabled && Boolean(deck1.track && deck2.track);
+    deck1Playing && deck2Playing && audioEnabled && Boolean(deck1.track && deck2.track);
 
   // Keep telemetry in sync when paused or when calibration sliders change
   useEffect(() => {
@@ -350,6 +385,7 @@ export default function App() {
               active: lpCur.active,
               gain: lpCur.gain,
               loopBeatsOverride: lpCur.loopBeatsOverride,
+              blendMode: lpCur.blendMode,
             }
           : undefined,
       };
@@ -378,6 +414,9 @@ export default function App() {
           elapsedBeats: curState.elapsedBeats,
           initialPhaseErrorMs: curMetrics.phaseErrorMs,
           resetCounters: true,
+          deck1Playing: deck1PlayingRef.current,
+          deck2Playing: deck2PlayingRef.current,
+          looperPlaying: looperPlayingRef.current,
         });
         return;
       }
@@ -465,6 +504,8 @@ export default function App() {
         deck2OffsetSec,
         deck1Rate,
         deck2Rate,
+        deck1Playing: deck1PlayingRef.current,
+        deck2Playing: deck2PlayingRef.current,
         deck1DetuneCents,
         deck2DetuneCents,
         looperOffsetSec: lpOffsetSec,
@@ -478,7 +519,7 @@ export default function App() {
     [buildWorkletParams, crossfader]
   );
 
-  // Transport clock + single-owner audio telemetry sync (with fallback AudioBufferSourceNode PLL)
+  // Transport clock + single-owner audio telemetry sync (zero 10 Hz root React re-renders)
   useEffect(() => {
     if (!isPlaying) {
       audioEngine.stopTrackSources();
@@ -490,10 +531,13 @@ export default function App() {
     let lastTime = performance.now();
     let lastCtxTime = audioEngine.getContextTimeSec() ?? 0;
     let lastUiSync = lastTime;
-    let lastWholeBeat = Math.floor(stateRef.current.elapsedBeats);
+    let lastWholeBeat = Math.floor(elapsedBeatsRef.current);
 
     if (audioEngine.isEnabled() && audioEngine.hasAnyLoadedTrack()) {
-      syncLiveAudioSources(stateRef.current, computePhaseMetrics(stateRef.current));
+      syncLiveAudioSources(
+        { ...stateRef.current, elapsedBeats: elapsedBeatsRef.current },
+        computePhaseMetrics(stateRef.current)
+      );
       lastCtxTime = audioEngine.getContextTimeSec() ?? lastCtxTime;
     }
 
@@ -512,7 +556,8 @@ export default function App() {
 
       const cur = stateRef.current;
       const t = tracksRef.current;
-      let nextBeats = cur.elapsedBeats + wallDtSec * (cur.masterBpm / 60);
+      const curBeats = elapsedBeatsRef.current;
+      let nextBeats = curBeats + wallDtSec * (cur.masterBpm / 60);
 
       if (audioEngine.isUsingWorklet() && (t.deck1 || t.deck2 || t.looper)) {
         // Single-transport-owner: AudioWorklet advances masterBeatPos & locks Deck 2 + Looper in the audio thread
@@ -521,7 +566,7 @@ export default function App() {
           const dtSinceTelemetrySec = Math.min(0.08, Math.max(0, (now - wt.receivedAtPerfMs) / 1000));
           nextBeats = wt.masterBeatPos + dtSinceTelemetrySec * (cur.masterBpm / 60);
 
-          if (t.deck1 && t.deck2) {
+          if (deck1PlayingRef.current && deck2PlayingRef.current && t.deck1 && t.deck2) {
             const nudgeActive = cur.syncMode === 'beat' && autoNudgeRef.current;
             const activeTrimCap = maxTrimPctRef.current;
             const prevTel = pllTelemetryRef.current;
@@ -652,7 +697,8 @@ export default function App() {
         );
       }
 
-      stateRef.current = { ...cur, elapsedBeats: nextBeats };
+      // Update mutable refs in place without triggering 10 Hz full-React tree re-renders
+      stateRef.current.elapsedBeats = nextBeats;
       elapsedBeatsRef.current = nextBeats;
 
       const wholeBeat = Math.floor(nextBeats);
@@ -664,9 +710,8 @@ export default function App() {
 
       if (now - lastUiSync >= 100) {
         lastUiSync = now;
-        setBarBeatDisplay(formatBarBeat(nextBeats));
-        setPllTelemetry(pllTelemetryRef.current);
-        setState((prev) => ({ ...prev, elapsedBeats: nextBeats }));
+        const nextTel = pllTelemetryRef.current;
+        setPllTelemetry((prevTel) => (telemetryEquals(prevTel, nextTel) ? prevTel : nextTel));
       }
     };
 
@@ -676,7 +721,7 @@ export default function App() {
     };
 
     rafId = window.requestAnimationFrame(tick);
-    // Keep PI-PLL running smoothly at 25 Hz even if tab is backgrounded / RAF throttled
+    // Keep fallback PI-PLL running cleanly at 25 Hz if tab is backgrounded / RAF throttled
     const bgInterval = window.setInterval(() => {
       const now = performance.now();
       if (now - lastTime >= 35) {
@@ -688,6 +733,8 @@ export default function App() {
       window.cancelAnimationFrame(rafId);
       window.clearInterval(bgInterval);
       audioEngine.stopTrackSources();
+      setBarBeatDisplay(formatBarBeat(elapsedBeatsRef.current));
+      setState((prev) => ({ ...prev, elapsedBeats: elapsedBeatsRef.current }));
     };
   }, [isPlaying, syncLiveAudioSources]);
 
@@ -745,6 +792,7 @@ export default function App() {
     looper.active,
     looper.gain,
     looper.loopBeatsOverride,
+    looper.blendMode,
     autoNudgeEnabled,
     maxNudgeTrimPct,
     crossfader,
@@ -826,15 +874,36 @@ export default function App() {
         setter(nextDeck);
       }
 
-      // Also keep Audio Looper Slot rhythmically aligned if a loop is loaded and Deck 1 (or Deck 2 fallback) changes
+      // Also keep Audio Looper Slot rhythmically + harmonically aligned if a loop is loaded
       const curLooper = looperRef.current;
       if (curLooper.track) {
-        const refDeck = deck === 1 ? { track, startBeatOffset: deck1Ref.current.startBeatOffset } : deck1Ref.current.track ? deck1Ref.current : { track, startBeatOffset: deck2Ref.current.startBeatOffset };
-        if (refDeck.track) {
+        const refDeckInfo =
+          deck === 1
+            ? {
+                track,
+                startBeatOffset: deck1Ref.current.startBeatOffset,
+                keyShiftSemitones: deck1Ref.current.keyShiftSemitones,
+              }
+            : deck1Ref.current.track
+              ? deck1Ref.current
+              : {
+                  track,
+                  startBeatOffset: deck2Ref.current.startBeatOffset,
+                  keyShiftSemitones: deck2Ref.current.keyShiftSemitones,
+                };
+        if (refDeckInfo.track) {
           const lpMatch = matchRhythmicStartingPoint(
-            refDeck.track,
+            refDeckInfo.track,
             curLooper.track,
-            refDeck.startBeatOffset
+            refDeckInfo.startBeatOffset
+          );
+          const masterKey = transposeKeyInfo(
+            refDeckInfo.track.musicalKey,
+            refDeckInfo.keyShiftSemitones
+          );
+          const autoKeyShift = findOptimalSemitoneMatch(
+            curLooper.track.musicalKey,
+            masterKey
           );
           setLooper((prev) => {
             const nextLp: LooperUiInfo = {
@@ -842,6 +911,8 @@ export default function App() {
               startBeatOffset: lpMatch.startBeatOffset,
               tempoMultiplier: lpMatch.tempoMultiplier,
               rhythmMatchPct: lpMatch.matchScorePct,
+              keyLock: true,
+              keyShiftSemitones: autoKeyShift,
             };
             looperRef.current = nextLp;
             return nextLp;
@@ -925,12 +996,19 @@ export default function App() {
       deck1Ref.current = EMPTY_DECK;
       setDeck1(EMPTY_DECK);
       setDeck2((prev) => ({ ...prev, rhythmMatchPct: null }));
+      deck1PlayingRef.current = false;
+      setDeck1Playing(false);
     } else {
       deck2Ref.current = EMPTY_DECK;
       setDeck2(EMPTY_DECK);
       setDeck1((prev) => ({ ...prev, rhythmMatchPct: null }));
+      deck2PlayingRef.current = false;
+      setDeck2Playing(false);
     }
-    setIsPlaying(false);
+    if ((deck === 1 && !deck2PlayingRef.current) || (deck === 2 && !deck1PlayingRef.current)) {
+      looperPlayingRef.current = false;
+      setLooperPlaying(false);
+    }
   }, []);
 
   const handleManualBpmChange = useCallback((deck: 1 | 2, bpm: number) => {
@@ -1042,6 +1120,12 @@ export default function App() {
     const match = refDeck?.track
       ? matchRhythmicStartingPoint(refDeck.track, track, refDeck.startBeatOffset)
       : null;
+    const autoKeyShift = refDeck?.track
+      ? findOptimalSemitoneMatch(
+          track.musicalKey,
+          transposeKeyInfo(refDeck.track.musicalKey, refDeck.keyShiftSemitones)
+        )
+      : 0;
     const soloStart = computeSoloStartBeat(track);
 
     const nextLooper: LooperUiInfo = {
@@ -1054,7 +1138,8 @@ export default function App() {
       startBeatOffset: match ? match.startBeatOffset : soloStart,
       tempoMultiplier: match ? match.tempoMultiplier : 1,
       rhythmMatchPct: match ? match.matchScorePct : null,
-      keyShiftSemitones: 0,
+      keyLock: true,
+      keyShiftSemitones: autoKeyShift,
       active: true,
       loopBeatsOverride: 0,
     };
@@ -1114,9 +1199,8 @@ export default function App() {
     audioEngine.clearLooper();
     looperRef.current = EMPTY_LOOPER;
     setLooper(EMPTY_LOOPER);
-    if (!deck1Ref.current.track && !deck2Ref.current.track) {
-      setIsPlaying(false);
-    }
+    looperPlayingRef.current = false;
+    setLooperPlaying(false);
   }, []);
 
   const handleLooperToggleActive = useCallback(() => {
@@ -1133,6 +1217,14 @@ export default function App() {
       const next = { ...prev, gain };
       looperRef.current = next;
       audioEngine.setLooperGain(next.gain, next.active);
+      return next;
+    });
+  }, []);
+
+  const handleLooperBlendModeChange = useCallback((blendMode: LooperBlendMode) => {
+    setLooper((prev) => {
+      const next = { ...prev, blendMode };
+      looperRef.current = next;
       return next;
     });
   }, []);
@@ -1359,24 +1451,92 @@ export default function App() {
     [isPlaying, audioEnabled, deck2.track, handleNudgeGridMs]
   );
 
-  const handleTogglePlay = useCallback(async () => {
-    if (!isPlaying) {
-      resetTelemetryCounters(computePhaseMetrics(stateRef.current).phaseErrorMs);
-      if (audioEngine.hasAnyLoadedTrack() && !audioEnabled) {
+  const handleToggleDeckPlay = useCallback(
+    async (deck: 1 | 2) => {
+      const currentlyDeckPlaying =
+        deck === 1 ? deck1PlayingRef.current : deck2PlayingRef.current;
+      const wantPlay = !currentlyDeckPlaying;
+      const wasAnyPlaying = isPlayingRef.current;
+
+      if (wantPlay && audioEngine.hasAnyLoadedTrack() && !audioEnabledRef.current) {
         const active = await audioEngine.setEnabled(true);
+        audioEnabledRef.current = active;
         setAudioEnabled(active);
       }
+
+      if (wantPlay && !wasAnyPlaying) {
+        resetTelemetryCounters(computePhaseMetrics(stateRef.current).phaseErrorMs);
+      }
+
+      const nextD1 = deck === 1 ? wantPlay : deck1PlayingRef.current;
+      const nextD2 = deck === 2 ? wantPlay : deck2PlayingRef.current;
+      const nextLp =
+        nextD1 || nextD2
+          ? Boolean(looperRef.current.track)
+          : false;
+
+      deck1PlayingRef.current = nextD1;
+      deck2PlayingRef.current = nextD2;
+      looperPlayingRef.current = nextLp;
+
+      setDeck1Playing(nextD1);
+      setDeck2Playing(nextD2);
+      setLooperPlaying(nextLp);
+
+      // If transport is ALREADY running and another deck joins or leaves, switch cleanly without interrupting active deck
+      if (wasAnyPlaying && (nextD1 || nextD2 || nextLp)) {
+        if (audioEngine.isUsingWorklet()) {
+          audioEngine.setWorkletDeckPlaying(deck, wantPlay, elapsedBeatsRef.current);
+        } else if (audioEngine.isEnabled() && audioEngine.hasAnyLoadedTrack()) {
+          syncLiveAudioSources(
+            { ...stateRef.current, elapsedBeats: elapsedBeatsRef.current },
+            computePhaseMetrics(stateRef.current)
+          );
+        }
+      }
+    },
+    [resetTelemetryCounters, syncLiveAudioSources]
+  );
+
+  const handleTogglePlay = useCallback(async () => {
+    if (!isPlayingRef.current) {
+      resetTelemetryCounters(computePhaseMetrics(stateRef.current).phaseErrorMs);
+      if (audioEngine.hasAnyLoadedTrack() && !audioEnabledRef.current) {
+        const active = await audioEngine.setEnabled(true);
+        audioEnabledRef.current = active;
+        setAudioEnabled(active);
+      }
+      const hasD1 = Boolean(deck1Ref.current.track);
+      const hasD2 = Boolean(deck2Ref.current.track);
+      const hasLp = Boolean(looperRef.current.track);
+      const playD1 = hasD1 || (!hasD2 && !hasLp);
+      const playD2 = hasD2 || (!hasD1 && !hasLp);
+      const playLp = hasLp;
+
+      deck1PlayingRef.current = playD1;
+      deck2PlayingRef.current = playD2;
+      looperPlayingRef.current = playLp;
+      setDeck1Playing(playD1);
+      setDeck2Playing(playD2);
+      setLooperPlaying(playLp);
+    } else {
+      deck1PlayingRef.current = false;
+      deck2PlayingRef.current = false;
+      looperPlayingRef.current = false;
+      setDeck1Playing(false);
+      setDeck2Playing(false);
+      setLooperPlaying(false);
     }
-    setIsPlaying((p) => !p);
-  }, [isPlaying, audioEnabled, resetTelemetryCounters]);
+  }, [resetTelemetryCounters]);
 
   const handleResetTransport = useCallback(() => {
     const initialErrMs = computePhaseMetrics(stateRef.current).phaseErrorMs;
     resetTelemetryCounters(initialErrMs);
+    elapsedBeatsRef.current = 0;
     setState((prev) => {
       const next = { ...prev, elapsedBeats: 0 };
       stateRef.current = next;
-      if (isPlaying && audioEnabled && audioEngine.hasAnyLoadedTrack()) {
+      if (isPlayingRef.current && audioEnabledRef.current && audioEngine.hasAnyLoadedTrack()) {
         if (audioEngine.isUsingWorklet()) {
           audioEngine.seekWorkletTransport(0, initialErrMs);
         } else {
@@ -1386,16 +1546,60 @@ export default function App() {
       return next;
     });
     setBarBeatDisplay('01.1.1');
-  }, [isPlaying, audioEnabled, syncLiveAudioSources, resetTelemetryCounters]);
+  }, [syncLiveAudioSources, resetTelemetryCounters]);
 
   const handleToggleAudio = useCallback(async () => {
-    const nextOn = !audioEnabled;
+    const nextOn = !audioEnabledRef.current;
     const active = await audioEngine.setEnabled(nextOn);
+    audioEnabledRef.current = active;
     setAudioEnabled(active);
-    if (active && isPlaying && audioEngine.hasAnyLoadedTrack()) {
-      syncLiveAudioSources(stateRef.current, computePhaseMetrics(stateRef.current));
+    if (active && isPlayingRef.current && audioEngine.hasAnyLoadedTrack()) {
+      syncLiveAudioSources(
+        { ...stateRef.current, elapsedBeats: elapsedBeatsRef.current },
+        computePhaseMetrics(stateRef.current)
+      );
     }
-  }, [audioEnabled, isPlaying, syncLiveAudioSources]);
+  }, [syncLiveAudioSources]);
+
+  const handleToggleAutoNudge = useCallback(() => {
+    setAutoNudgeEnabled((p) => !p);
+  }, []);
+
+  const handleMaxNudgeTrimChange = useCallback((pct: number) => {
+    setMaxNudgeTrimPct(pct);
+  }, []);
+
+  const handleZoomChange = useCallback((zoom: 1 | 4 | 16) => {
+    setState((p) => ({ ...p, zoomLevel: zoom }));
+  }, []);
+
+  const handleSyncModeChange = useCallback((mode: SyncMode) => {
+    setState((p) => ({ ...p, syncMode: mode }));
+  }, []);
+
+  const handleGridModeChange = useCallback((mode: GridMode) => {
+    setState((p) => ({ ...p, gridMode: mode }));
+  }, []);
+
+  const handleToggleQuantize = useCallback(() => {
+    setState((p) => ({ ...p, quantize: !p.quantize }));
+  }, []);
+
+  const handleSetGridOffsetMs = useCallback((ms: number) => {
+    setState((p) => ({ ...p, gridOffsetMs: ms }));
+  }, []);
+
+  const handleSetLatencyMs = useCallback((ms: number) => {
+    setState((p) => ({ ...p, audioLatencyMs: ms }));
+  }, []);
+
+  const handleSetBpmOffset = useCallback((bpmDelta: number) => {
+    setState((p) => ({ ...p, deck2BpmOffset: bpmDelta }));
+  }, []);
+
+  const handleToggleGuideStep = useCallback((id: string) => {
+    setCompletedSteps((prev) => ({ ...prev, [id]: !prev[id] }));
+  }, []);
 
   const handleSimulateFromGuide = useCallback(
     (scenarioId: string) => {
@@ -1459,16 +1663,18 @@ export default function App() {
             deck2={deck2}
             crossfader={crossfader}
             isSynced={isSynced}
-            isPlaying={isPlaying}
-            elapsedBeats={state.elapsedBeats}
+            deck1Playing={deck1Playing}
+            deck2Playing={deck2Playing}
+            elapsedBeatsRef={elapsedBeatsRef}
             masterBpm={state.masterBpm}
             deck2RateTrimPct={pllTelemetry.rateTrimPct}
             livePhaseErrorMs={hasDualTracksPlaying ? pllTelemetry.livePhaseErrorMs : metrics.phaseErrorMs}
             autoNudgeEnabled={autoNudgeEnabled}
             maxNudgeTrimPct={maxNudgeTrimPct}
+            onToggleDeckPlay={handleToggleDeckPlay}
             onToggleSync={handleToggleSync}
-            onToggleAutoNudge={() => setAutoNudgeEnabled((p) => !p)}
-            onMaxNudgeTrimChange={(pct) => setMaxNudgeTrimPct(pct)}
+            onToggleAutoNudge={handleToggleAutoNudge}
+            onMaxNudgeTrimChange={handleMaxNudgeTrimChange}
             onManualPhaseNudge={handleManualPhaseNudge}
             onSnapPhaseZero={handleSnapToZero}
             onLoadFile={handleLoadLocalFile}
@@ -1506,6 +1712,7 @@ export default function App() {
             onClear={handleClearLooper}
             onToggleActive={handleLooperToggleActive}
             onGainChange={handleLooperGainChange}
+            onBlendModeChange={handleLooperBlendModeChange}
             onBpmChange={handleLooperBpmChange}
             onAnchorShift={handleLooperAnchorShift}
             onLoopBeatsChange={handleLooperLoopBeatsChange}
@@ -1534,7 +1741,7 @@ export default function App() {
                 onToggleSync={handleToggleSync}
                 onToggleAudio={handleToggleAudio}
                 onResetTransport={handleResetTransport}
-                onZoomChange={(zoom) => setState((p) => ({ ...p, zoomLevel: zoom }))}
+                onZoomChange={handleZoomChange}
               />
             </div>
 
@@ -1543,19 +1750,13 @@ export default function App() {
                 state={state}
                 metrics={metrics}
                 onSelectScenario={handleSelectScenario}
-                onSyncModeChange={(mode: SyncMode) =>
-                  setState((p) => ({ ...p, syncMode: mode }))
-                }
-                onGridModeChange={(mode: GridMode) =>
-                  setState((p) => ({ ...p, gridMode: mode }))
-                }
-                onToggleQuantize={() => setState((p) => ({ ...p, quantize: !p.quantize }))}
+                onSyncModeChange={handleSyncModeChange}
+                onGridModeChange={handleGridModeChange}
+                onToggleQuantize={handleToggleQuantize}
                 onNudgeGridMs={handleNudgeGridMs}
-                onSetGridOffsetMs={(ms) => setState((p) => ({ ...p, gridOffsetMs: ms }))}
-                onSetLatencyMs={(ms) => setState((p) => ({ ...p, audioLatencyMs: ms }))}
-                onSetBpmOffset={(bpmDelta) =>
-                  setState((p) => ({ ...p, deck2BpmOffset: bpmDelta }))
-                }
+                onSetGridOffsetMs={handleSetGridOffsetMs}
+                onSetLatencyMs={handleSetLatencyMs}
+                onSetBpmOffset={handleSetBpmOffset}
                 onSnapToZero={handleSnapToZero}
               />
             </div>
@@ -1564,9 +1765,7 @@ export default function App() {
 
         <DjayGuideSection
           completedSteps={completedSteps}
-          onToggleStep={(id) =>
-            setCompletedSteps((prev) => ({ ...prev, [id]: !prev[id] }))
-          }
+          onToggleStep={handleToggleGuideStep}
           onSimulateScenario={handleSimulateFromGuide}
         />
 

@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { memo, useState } from 'react';
 import { calculateDriftMath } from '../utils/phaseMath';
 
-export const DriftCalculatorSection: React.FC = () => {
+export const DriftCalculatorSection: React.FC = memo(() => {
   const [bpm, setBpm] = useState<number>(124);
   const [bpmDelta, setBpmDelta] = useState<number>(0.15);
   const [bars, setBars] = useState<number>(16);
@@ -130,4 +130,4 @@ export const DriftCalculatorSection: React.FC = () => {
       </div>
     </section>
   );
-};
+});

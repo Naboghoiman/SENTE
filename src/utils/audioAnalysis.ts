@@ -113,6 +113,76 @@ export function lowPassFilter(
   return out;
 }
 
+let scratchLpBuf = new Float32Array(0);
+
+function zeroPhaseLowPassInto(
+  samples: Float32Array,
+  sampleRate: number,
+  cutoffHz: number,
+  out: Float32Array
+): void {
+  const n = samples.length;
+  if (n === 0 || sampleRate <= cutoffHz * 2) {
+    out.set(samples);
+    return;
+  }
+  const omega = (2 * Math.PI * cutoffHz) / sampleRate;
+  const sinO = Math.sin(omega);
+  const cosO = Math.cos(omega);
+  const alpha = sinO / Math.SQRT2;
+
+  const a0 = 1 + alpha;
+  const invA0 = 1 / a0;
+  const nb0 = ((1 - cosO) * 0.5) * invA0;
+  const nb1 = (1 - cosO) * invA0;
+  const nb2 = nb0;
+  const na1 = (-2 * cosO) * invA0;
+  const na2 = (1 - alpha) * invA0;
+
+  let x1 = 0;
+  let x2 = 0;
+  let y1 = 0;
+  let y2 = 0;
+  for (let i = 0; i < n; i++) {
+    const x0 = samples[i];
+    const y0 = nb0 * x0 + nb1 * x1 + nb2 * x2 - na1 * y1 - na2 * y2;
+    out[i] = y0;
+    x2 = x1;
+    x1 = x0;
+    y2 = y1;
+    y1 = y0;
+  }
+
+  x1 = 0;
+  x2 = 0;
+  y1 = 0;
+  y2 = 0;
+  for (let i = n - 1; i >= 0; i--) {
+    const x0 = out[i];
+    const y0 = nb0 * x0 + nb1 * x1 + nb2 * x2 - na1 * y1 - na2 * y2;
+    out[i] = y0;
+    x2 = x1;
+    x1 = x0;
+    y2 = y1;
+    y1 = y0;
+  }
+}
+
+function zeroPhaseLowPassWindow(
+  samples: Float32Array,
+  sampleRate: number,
+  cutoffHz: number
+): Float32Array {
+  const n = samples.length;
+  if (n === 0 || sampleRate <= cutoffHz * 2) return samples;
+  if (scratchLpBuf.length < n) {
+    scratchLpBuf = new Float32Array(Math.max(n, 4096));
+  }
+  const view = scratchLpBuf.subarray(0, n);
+  zeroPhaseLowPassInto(samples, sampleRate, cutoffHz, view);
+  return view;
+}
+
 /**
  * Zero-phase forward-backward Butterworth low-pass filter (filtfilt).
  * Eliminates 100% of filter group delay so kick peaks align sample-accurately
@@ -123,18 +193,9 @@ export function zeroPhaseLowPassFilter(
   sampleRate: number,
   cutoffHz = 165
 ): Float32Array {
-  const fwd = lowPassFilter(samples, sampleRate, cutoffHz);
-  if (fwd.length === 0 || sampleRate <= cutoffHz * 2) return fwd;
-
-  const revIn = new Float32Array(fwd.length);
-  for (let i = 0; i < fwd.length; i++) {
-    revIn[i] = fwd[fwd.length - 1 - i];
-  }
-  const revOut = lowPassFilter(revIn, sampleRate, cutoffHz);
-  const out = new Float32Array(revOut.length);
-  for (let i = 0; i < revOut.length; i++) {
-    out[i] = revOut[revOut.length - 1 - i];
-  }
+  if (samples.length === 0 || sampleRate <= cutoffHz * 2) return samples;
+  const out = new Float32Array(samples.length);
+  zeroPhaseLowPassInto(samples, sampleRate, cutoffHz, out);
   return out;
 }
 
@@ -156,7 +217,7 @@ function extrapolateRawKickOnsetSec(
   const s1 = Math.min(n, lowPeakIdx + Math.floor(sampleRate * 0.02));
   const localSlice = samples.subarray(s0, s1);
   const cutoff = Math.min(580, sampleRate * 0.42);
-  const localLow = zeroPhaseLowPassFilter(localSlice, sampleRate, cutoff);
+  const localLow = zeroPhaseLowPassWindow(localSlice, sampleRate, cutoff);
   const offsetInSlice = lowPeakIdx - s0;
 
   // Scan [-28 ms, +4 ms] around lowPeakIdx so 165 Hz low-pass lag never clips the first cycle
@@ -279,7 +340,7 @@ function computeFoldedKickOffsetSec(
     const s0 = Math.max(0, centerS - halfSamples - padSamples);
     const s1 = Math.min(n, centerS + halfSamples + padSamples);
     if (s1 - s0 < 16) continue;
-    const localLow = zeroPhaseLowPassFilter(samples.subarray(s0, s1), sampleRate, cutoff);
+    const localLow = zeroPhaseLowPassWindow(samples.subarray(s0, s1), sampleRate, cutoff);
 
     for (let b = 0; b < binCount; b++) {
       const tau = -halfWinSec + b * binSec;
@@ -532,19 +593,24 @@ export function analyzeBeatGrid(
     };
   }
 
+  // 1. Zero-phase forward-backward low-pass filter (0.00 ms group delay!) across full song (up to 600s)
+  const maxTrackSamples = Math.min(samples.length, Math.floor(sampleRate * 600));
+  const trackSlice = samples.subarray(0, maxTrackSamples);
+  const lowFull = zeroPhaseLowPassFilter(trackSlice, sampleRate, 165);
+
   // Locate first active low-band body if song opens with a long ambient/beatless intro
-  const lowScanLimit = Math.min(samples.length, Math.floor(sampleRate * 90));
-  const lowBodyPreview = zeroPhaseLowPassFilter(samples.subarray(0, lowScanLimit), sampleRate, 170);
+  const lowScanLimit = Math.min(lowFull.length, Math.floor(sampleRate * 90));
   let bodyMaxAmp = 0;
-  for (let i = 0; i < lowBodyPreview.length; i += 8) {
-    const a = Math.abs(lowBodyPreview[i]);
+  for (let i = 0; i < lowScanLimit; i += 8) {
+    const a = Math.abs(lowFull[i]);
     if (a > bodyMaxAmp) bodyMaxAmp = a;
   }
   let bodyStartSec = Math.max(0, fallbackTransientMs / 1000 - 0.05);
   if (bodyMaxAmp > 0.005) {
     const bodyGate = bodyMaxAmp * 0.35;
-    for (let i = 0; i < lowBodyPreview.length; i += Math.max(1, Math.floor(sampleRate * 0.02))) {
-      if (Math.abs(lowBodyPreview[i]) >= bodyGate) {
+    const scanStep = Math.max(1, Math.floor(sampleRate * 0.02));
+    for (let i = 0; i < lowScanLimit; i += scanStep) {
+      if (Math.abs(lowFull[i]) >= bodyGate) {
         bodyStartSec = Math.max(0, i / sampleRate - 0.05);
         break;
       }
@@ -572,21 +638,40 @@ export function analyzeBeatGrid(
     };
   }
 
-  // 1. Harmonic comb autocorrelation across 70-175 BPM at 1-frame resolution
+  // 2. Harmonic comb autocorrelation across 70-175 BPM using sparse non-zero flux index list
   const minLag = Math.max(100, Math.floor((60 / 175) * envRate));
   const maxLag = Math.min(Math.floor(frameCount * 0.62), Math.ceil((60 / 70) * envRate));
 
+  let nzCount = 0;
+  for (let i = 0; i < frameCount; i += 2) {
+    if (flux[i] > 0) nzCount++;
+  }
+  const nzIdx = new Int32Array(nzCount);
+  const nzVal = new Float32Array(nzCount);
+  {
+    let p = 0;
+    for (let i = 0; i < frameCount; i += 2) {
+      const v = flux[i];
+      if (v > 0) {
+        nzIdx[p] = i;
+        nzVal[p] = v;
+        p++;
+      }
+    }
+  }
+
   const acfScore = (lag: number): number => {
     if (lag >= frameCount) return 0;
+    const limit = frameCount - lag;
+    const count = (limit + 1) >> 1;
+    if (count <= 0) return 0;
     let score = 0;
-    let count = 0;
-    for (let i = 0; i < frameCount - lag; i += 2) {
-      if (flux[i] > 0) {
-        score += flux[i] * flux[i + lag];
-      }
-      count++;
+    for (let p = 0; p < nzCount; p++) {
+      const i = nzIdx[p];
+      if (i >= limit) break;
+      score += nzVal[p] * flux[i + lag];
     }
-    return count > 0 ? score / count : 0;
+    return score / count;
   };
 
   const combScores = new Float32Array(maxLag + 1);
@@ -690,13 +775,9 @@ export function analyzeBeatGrid(
     return (((startOffsetSec + phaseOffsetInPeriodSec) % beatPeriodSec) + beatPeriodSec) % beatPeriodSec;
   };
 
-  // 3. Zero-phase forward-backward low-pass filter (0.00 ms group delay!) across full song (up to 600s)
-  const maxTrackSamples = Math.min(samples.length, Math.floor(sampleRate * 600));
-  const trackSlice = samples.subarray(0, maxTrackSamples);
-  const lowFull = zeroPhaseLowPassFilter(trackSlice, sampleRate, 165);
-
-  let maxLowAmp = 0;
-  for (let i = 0; i < lowFull.length; i += 8) {
+  // Re-use maxLowAmp scan over full trackSlice
+  let maxLowAmp = bodyMaxAmp;
+  for (let i = lowScanLimit; i < lowFull.length; i += 8) {
     const a = Math.abs(lowFull[i]);
     if (a > maxLowAmp) maxLowAmp = a;
   }

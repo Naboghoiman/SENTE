@@ -464,3 +464,274 @@ test('Audio Looper Slot supports 0.5x half-time continuous synchronization acros
     );
   }
 });
+
+test('Separate Deck 1 / Deck 2 play & pause drops incoming deck at 0.00 ms sync without interrupting the active deck', () => {
+  const sr = 44100;
+  const bpm = 124;
+  const song1 = buildClickLoop(bpm, 24, sr, 0, 0);
+  const song2 = buildClickLoop(bpm, 24, sr, 15.0, 0);
+  const { processor, telemetryLog } = createWorkletProcessor(sr);
+
+  sendMsg(processor, {
+    type: 'loadTrack',
+    deck: 1,
+    channels: [song1],
+    length: song1.length,
+    trackSampleRate: sr,
+    durationSec: song1.length / sr,
+    bpm,
+    anchorMs: 0,
+    keyLock: false,
+    keyShiftSemitones: 0,
+  });
+  sendMsg(processor, {
+    type: 'loadTrack',
+    deck: 2,
+    channels: [song2],
+    length: song2.length,
+    trackSampleRate: sr,
+    durationSec: song2.length / sr,
+    bpm,
+    anchorMs: 15.0,
+    keyLock: false,
+    keyShiftSemitones: 0,
+  });
+  sendMsg(processor, {
+    type: 'setParams',
+    masterBpm: bpm,
+    syncMode: 'beat',
+    desiredOffsetMs: 0,
+    crossfader: 1, // Monitor Deck 2 solo initially to verify silence while Deck 1 plays solo
+  });
+
+  // Start ONLY Deck 1
+  sendMsg(processor, {
+    type: 'setDeckPlaying',
+    deck: 1,
+    playing: true,
+    elapsedBeats: 0,
+  });
+
+  const blockFrames = 128;
+  const outBlock = [new Float32Array(blockFrames), new Float32Array(blockFrames)];
+  let maxDeck2WhilePaused = 0;
+  for (let b = 0; b < 500; b++) {
+    outBlock[0].fill(0);
+    outBlock[1].fill(0);
+    processor.process([], [outBlock]);
+    for (let i = 0; i < blockFrames; i++) {
+      maxDeck2WhilePaused = Math.max(maxDeck2WhilePaused, Math.abs(outBlock[0][i]));
+    }
+  }
+  assert.equal(maxDeck2WhilePaused, 0, 'Deck 2 must remain digitally silent while only Deck 1 plays');
+  assert.equal(telemetryLog[telemetryLog.length - 1]?.deck1Playing, true);
+  assert.equal(telemetryLog[telemetryLog.length - 1]?.deck2Playing, false);
+
+  // Drop Deck 2 IN mid-song -> must align at 0.00 ms with Deck 1
+  sendMsg(processor, { type: 'setDeckPlaying', deck: 2, playing: true });
+  const afterDropTel = telemetryLog[telemetryLog.length - 1];
+  assert.equal(afterDropTel?.deck1Playing, true);
+  assert.equal(afterDropTel?.deck2Playing, true);
+  assert.equal(afterDropTel?.livePhaseErrorMs, 0);
+
+  // Render 2 seconds with crossfader = 0 (both decks blended) and verify Deck 2 beats land on exact master beats
+  sendMsg(processor, { type: 'setParams', crossfader: 0 });
+  const offsetFrames = 500 * blockFrames;
+  const blended = new Float32Array(700 * blockFrames);
+  for (let b = 0; b < 700; b++) {
+    outBlock[0].fill(0);
+    outBlock[1].fill(0);
+    processor.process([], [outBlock]);
+    blended.set(outBlock[0], b * blockFrames);
+  }
+  const blendedPeaks = findTransientOnsets(blended, sr, 0.35, 0.3);
+  assert.ok(blendedPeaks.length >= 3, `Expected >= 3 blended beats, got ${blendedPeaks.length}`);
+  const beatSamples = (60 / bpm) * sr;
+  for (const peak of blendedPeaks) {
+    const beatFloat = (offsetFrames + peak) / beatSamples;
+    const errMs = Math.abs(beatFloat - Math.round(beatFloat)) * (60000 / bpm);
+    assert.ok(errMs <= 0.1, `Expected mid-mix Deck 2 drop-in aligned <= 0.10 ms, got ${errMs.toFixed(2)} ms`);
+  }
+
+  // Pause Deck 1 while Deck 2 stays playing; crossfade to Deck 1 (-1) must be digitally silent
+  sendMsg(processor, { type: 'setDeckPlaying', deck: 1, playing: false });
+  sendMsg(processor, { type: 'setParams', crossfader: -1 });
+  let maxDeck1AfterPause = 0;
+  for (let b = 0; b < 100; b++) {
+    outBlock[0].fill(0);
+    outBlock[1].fill(0);
+    processor.process([], [outBlock]);
+    for (let i = 0; i < blockFrames; i++) {
+      maxDeck1AfterPause = Math.max(maxDeck1AfterPause, Math.abs(outBlock[0][i]));
+    }
+  }
+  assert.equal(maxDeck1AfterPause, 0, 'Deck 1 must be silent after Pause D1 while Deck 2 runs');
+  assert.equal(telemetryLog[telemetryLog.length - 1]?.deck1Playing, false);
+  assert.equal(telemetryLog[telemetryLog.length - 1]?.deck2Playing, true);
+});
+
+test('Looper Acoustic Blend EQ clears sub-bass clash when layered with a song, bypasses solo, and soft-knee limiter prevents clipping', () => {
+  const sr = 44100;
+  const bpm = 124;
+  const beatSec = 60 / bpm;
+  const loopLen = Math.round(4 * beatSec * sr);
+  const loopSubAndHat = new Float32Array(loopLen);
+  for (let i = 0; i < loopLen; i++) {
+    const t = i / sr;
+    // Heavy 60 Hz sub-bass + crisp 2.2 kHz hi-hat harmonic
+    loopSubAndHat[i] = 0.72 * Math.sin(2 * Math.PI * 60 * t) + 0.25 * Math.sin(2 * Math.PI * 2200 * t);
+  }
+
+  // Silent-ish 1kHz low-level carrier on Deck 1 (only to mark songDeckAudible without masking 60Hz measurement)
+  const songQuiet = new Float32Array(loopLen);
+  for (let i = 0; i < loopLen; i++) {
+    songQuiet[i] = 0.001 * Math.sin((2 * Math.PI * 1000 * i) / sr);
+  }
+
+  const measure60HzRms = (blendMode: string, deck1Playing: boolean) => {
+    const { processor } = createWorkletProcessor(sr);
+    sendMsg(processor, {
+      type: 'loadTrack',
+      deck: 1,
+      channels: [songQuiet],
+      length: songQuiet.length,
+      trackSampleRate: sr,
+      durationSec: songQuiet.length / sr,
+      bpm,
+      anchorMs: 0,
+      keyLock: false,
+      keyShiftSemitones: 0,
+    });
+    sendMsg(processor, {
+      type: 'loadLooperTrack',
+      channels: [loopSubAndHat],
+      length: loopSubAndHat.length,
+      trackSampleRate: sr,
+      durationSec: loopSubAndHat.length / sr,
+      bpm,
+      anchorMs: 0,
+      keyLock: false,
+      keyShiftSemitones: 0,
+      active: true,
+      gain: 0.9,
+      blendMode,
+    });
+    sendMsg(processor, { type: 'setParams', masterBpm: bpm, crossfader: -1 });
+    sendMsg(processor, {
+      type: 'start',
+      elapsedBeats: 0,
+      deck1Playing,
+      deck2Playing: false,
+      looperPlaying: true,
+    });
+
+    const blockFrames = 128;
+    const totalBlocks = 140;
+    const out = new Float32Array(totalBlocks * blockFrames);
+    const outBlock = [new Float32Array(blockFrames), new Float32Array(blockFrames)];
+    for (let b = 0; b < totalBlocks; b++) {
+      outBlock[0].fill(0);
+      outBlock[1].fill(0);
+      processor.process([], [outBlock]);
+      out.set(outBlock[0], b * blockFrames);
+    }
+
+    // Measure 60 Hz & 2200 Hz DFT bin magnitudes over steady-state window [4096..12288)
+    let re60 = 0;
+    let im60 = 0;
+    let re2200 = 0;
+    let im2200 = 0;
+    const nWin = 8192;
+    for (let n = 0; n < nWin; n++) {
+      const s = out[4096 + n];
+      const a60 = (2 * Math.PI * 60 * n) / sr;
+      re60 += s * Math.cos(a60);
+      im60 -= s * Math.sin(a60);
+      const a2200 = (2 * Math.PI * 2200 * n) / sr;
+      re2200 += s * Math.cos(a2200);
+      im2200 -= s * Math.sin(a2200);
+    }
+    return {
+      mag60: Math.hypot(re60, im60) / nWin,
+      mag2200: Math.hypot(re2200, im2200) / nWin,
+    };
+  };
+
+  const fullStats = measure60HzRms('full', true);
+  const autoBlendStats = measure60HzRms('auto', true);
+  const autoSoloStats = measure60HzRms('auto', false);
+  const topStats = measure60HzRms('top-260', true);
+
+  const autoSubDropDb = 20 * Math.log10(fullStats.mag60 / Math.max(1e-9, autoBlendStats.mag60));
+  const topSubDropDb = 20 * Math.log10(fullStats.mag60 / Math.max(1e-9, topStats.mag60));
+  assert.ok(
+    autoSubDropDb >= 10,
+    `Expected Auto Blend EQ to attenuate 60 Hz sub-bass by >= 10 dB when layered with song, got ${autoSubDropDb.toFixed(1)} dB`
+  );
+  assert.ok(
+    topSubDropDb >= 20,
+    `Expected Tops 260Hz EQ to attenuate 60 Hz sub-bass by >= 20 dB, got ${topSubDropDb.toFixed(1)} dB`
+  );
+  assert.ok(
+    autoSoloStats.mag60 > fullStats.mag60 * 0.9,
+    'Expected Auto Blend EQ to preserve full 60 Hz sub-bass when Looper plays solo'
+  );
+  assert.ok(
+    autoBlendStats.mag2200 > fullStats.mag2200 * 0.9,
+    'Expected Auto Blend EQ to preserve >= 90% upper-mid/high shimmer'
+  );
+
+  // Anti-clipping soft-knee master limiter check with hot Deck 1 + Deck 2 + Looper sum
+  const { processor: hotProc } = createWorkletProcessor(sr);
+  const hotWave = new Float32Array(sr * 2);
+  hotWave.fill(0.95);
+  sendMsg(hotProc, {
+    type: 'loadTrack',
+    deck: 1,
+    channels: [hotWave],
+    length: hotWave.length,
+    trackSampleRate: sr,
+    durationSec: 2,
+    bpm: 124,
+    anchorMs: 0,
+    keyLock: false,
+  });
+  sendMsg(hotProc, {
+    type: 'loadTrack',
+    deck: 2,
+    channels: [hotWave],
+    length: hotWave.length,
+    trackSampleRate: sr,
+    durationSec: 2,
+    bpm: 124,
+    anchorMs: 0,
+    keyLock: false,
+  });
+  sendMsg(hotProc, {
+    type: 'loadLooperTrack',
+    channels: [hotWave],
+    length: hotWave.length,
+    trackSampleRate: sr,
+    durationSec: 2,
+    bpm: 124,
+    anchorMs: 0,
+    keyLock: false,
+    active: true,
+    gain: 1.2,
+    blendMode: 'full',
+  });
+  sendMsg(hotProc, { type: 'setParams', masterBpm: 124, crossfader: 0 });
+  sendMsg(hotProc, { type: 'start', elapsedBeats: 0 });
+  const hotOut = [new Float32Array(128), new Float32Array(128)];
+  let maxPeak = 0;
+  for (let b = 0; b < 50; b++) {
+    hotOut[0].fill(0);
+    hotOut[1].fill(0);
+    hotProc.process([], [hotOut]);
+    for (let i = 0; i < 128; i++) {
+      maxPeak = Math.max(maxPeak, Math.abs(hotOut[0][i]));
+    }
+  }
+  assert.ok(maxPeak <= 1.0, `Expected soft-knee limiter output <= 1.0, got ${maxPeak}`);
+});
+

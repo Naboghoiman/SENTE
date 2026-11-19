@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { memo, useEffect, useRef } from 'react';
 import { Pause, Play, RotateCcw, Volume2, VolumeX } from 'lucide-react';
 import {
   type CalibrationState,
@@ -30,6 +30,16 @@ export interface LoadedTracksRefPayload {
   looperTempoMult?: 0.5 | 1 | 2;
   looperLoopBeats?: number;
   looperActive?: boolean;
+  deck1Playing?: boolean;
+  deck2Playing?: boolean;
+}
+
+function formatBarBeatLocal(elapsedBeats: number): string {
+  const wholeBeat = Math.floor(elapsedBeats);
+  const bar = Math.floor(wholeBeat / 4) + 1;
+  const beat = (wholeBeat % 4) + 1;
+  const sub = Math.floor((elapsedBeats - wholeBeat) * 4) + 1;
+  return `${String(bar).padStart(2, '0')}.${beat}.${sub}`;
 }
 
 interface PhaseCanvasStageProps {
@@ -51,7 +61,7 @@ interface PhaseCanvasStageProps {
   onZoomChange: (zoom: 1 | 4 | 16) => void;
 }
 
-export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = ({
+export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = memo(({
   stateRef,
   tracksRef,
   pllTelemetryRef,
@@ -70,10 +80,24 @@ export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = ({
   onZoomChange,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const canvasSizeRef = useRef<{ width: number; height: number }>({ width: 720, height: 340 });
+  const drawFrameRef = useRef<(() => void) | null>(null);
+  const posReadoutRef = useRef<HTMLSpanElement | null>(null);
 
   useEffect(() => {
     let rafId = 0;
     let disposed = false;
+
+    const canvasEl = canvasRef.current;
+    if (canvasEl) {
+      const rect = canvasEl.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        canvasSizeRef.current = {
+          width: Math.max(320, Math.floor(rect.width)),
+          height: Math.max(290, Math.floor(rect.height)),
+        };
+      }
+    }
 
     const drawFrame = () => {
       if (disposed) return;
@@ -83,9 +107,8 @@ export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = ({
       if (!ctx) return;
 
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      const rect = canvas.getBoundingClientRect();
-      const width = Math.max(320, Math.floor(rect.width));
-      const height = Math.max(290, Math.floor(rect.height));
+      const width = canvasSizeRef.current.width;
+      const height = canvasSizeRef.current.height;
 
       if (canvas.width !== width * dpr || canvas.height !== height * dpr) {
         canvas.width = width * dpr;
@@ -98,6 +121,9 @@ export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = ({
       const st = stateRef.current;
       const tracks = tracksRef.current;
       const livePll = pllTelemetryRef.current;
+      if (posReadoutRef.current) {
+        posReadoutRef.current.textContent = formatBarBeatLocal(st.elapsedBeats);
+      }
       const currentMetrics = computePhaseMetrics(st);
       const beatDurationMs = 60000 / Math.max(40, st.masterBpm);
 
@@ -452,12 +478,19 @@ export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = ({
       }
     };
 
+    drawFrameRef.current = drawFrame;
     drawFrame();
 
-    const canvasEl = canvasRef.current;
     let observer: ResizeObserver | null = null;
     if (canvasEl && typeof ResizeObserver !== 'undefined') {
-      observer = new ResizeObserver(() => {
+      observer = new ResizeObserver((entries) => {
+        const entry = entries[0];
+        if (entry && entry.contentRect.width > 0 && entry.contentRect.height > 0) {
+          canvasSizeRef.current = {
+            width: Math.max(320, Math.floor(entry.contentRect.width)),
+            height: Math.max(290, Math.floor(entry.contentRect.height)),
+          };
+        }
         if (!isPlaying) drawFrame();
       });
       observer.observe(canvasEl);
@@ -465,10 +498,18 @@ export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = ({
 
     return () => {
       disposed = true;
+      drawFrameRef.current = null;
       if (rafId) window.cancelAnimationFrame(rafId);
       if (observer) observer.disconnect();
     };
-  }, [stateRef, tracksRef, pllTelemetryRef, isPlaying, audioEnabled, zoomLevel, metrics]);
+  }, [stateRef, tracksRef, pllTelemetryRef, isPlaying, audioEnabled]);
+
+  // Trigger single-frame repaint when calibration metrics or zoom change while paused
+  useEffect(() => {
+    if (!isPlaying) {
+      drawFrameRef.current?.();
+    }
+  }, [isPlaying, zoomLevel, metrics, barBeatDisplay]);
 
   const displayedErrorMs = hasDualTracksPlaying
     ? pllTelemetry.livePhaseErrorMs
@@ -643,7 +684,9 @@ export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = ({
             </div>
             <div>
               <span className="text-slate-500 mr-1.5">POS</span>
-              <span className="font-semibold text-white">{barBeatDisplay}</span>
+              <span ref={posReadoutRef} className="font-semibold text-white">
+                {barBeatDisplay}
+              </span>
             </div>
             <div>
               <span className="text-slate-500 mr-1.5">NOTCH</span>
@@ -807,4 +850,4 @@ export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = ({
       </div>
     </section>
   );
-};
+});

@@ -10,6 +10,8 @@ export interface LoadedDeckTrack extends AnalyzedTrackData {
   isDemo: boolean;
 }
 
+export type LooperBlendMode = 'auto' | 'blend-140' | 'top-260' | 'full';
+
 export interface WorkletTelemetry {
   masterBeatPos: number;
   deck2BeatPos: number;
@@ -23,6 +25,9 @@ export interface WorkletTelemetry {
   looperBeatPos: number;
   looperLoopBeats: number;
   looperPhaseErrorMs: number;
+  deck1Playing: boolean;
+  deck2Playing: boolean;
+  looperPlaying: boolean;
   receivedAtPerfMs: number;
 }
 
@@ -41,6 +46,7 @@ export interface LooperGridWorkletPatch extends DeckGridWorkletPatch {
   active?: boolean;
   gain?: number;
   loopBeatsOverride?: number;
+  blendMode?: LooperBlendMode;
 }
 
 export interface WorkletParamsPayload {
@@ -116,7 +122,13 @@ class DualDeckAudioEngine {
   private looperCursor: DeckPlaybackCursor | null = null;
   private looperActive = true;
   private looperLevel = 0.85;
+  private looperBlendMode: LooperBlendMode = 'auto';
+  private looperFilter: BiquadFilterNode | null = null;
   private lastResyncCtxTime = -1;
+
+  // Background Analysis Worker state
+  private analysisWorker: Worker | null = null;
+  private workerReqId = 0;
 
   // AudioWorklet Single-Transport-Owner state
   private workletNode: AudioWorkletNode | null = null;
@@ -124,6 +136,11 @@ class DualDeckAudioEngine {
   private workletLoadPromise: Promise<boolean> | null = null;
   private workletTelemetry: WorkletTelemetry | null = null;
   private pendingWorkletParams: WorkletParamsPayload | null = null;
+  private lastSentBeatTimes: {
+    1: number[] | undefined;
+    2: number[] | undefined;
+    looper: number[] | undefined;
+  } = { 1: undefined, 2: undefined, looper: undefined };
 
   private ensureContext(): AudioContext | null {
     if (typeof window === 'undefined') return null;
@@ -136,8 +153,14 @@ class DualDeckAudioEngine {
         this.deck1Gain = this.ctx.createGain();
         this.deck2Gain = this.ctx.createGain();
         this.looperGain = this.ctx.createGain();
+        this.looperFilter = this.ctx.createBiquadFilter();
+        this.looperFilter.type = 'highpass';
+        this.looperFilter.frequency.value = 10;
+        this.looperFilter.Q.value = Math.SQRT1_2;
+
         this.deck1Gain.connect(this.ctx.destination);
         this.deck2Gain.connect(this.ctx.destination);
+        this.looperFilter.connect(this.looperGain);
         this.looperGain.connect(this.ctx.destination);
         this.applyCrossfaderGains();
         this.looperGain.gain.setValueAtTime(
@@ -157,7 +180,7 @@ class DualDeckAudioEngine {
 
     this.workletLoadPromise = (async () => {
       try {
-        await ctx.audioWorklet.addModule('/phasezero-worklet.js?v=3');
+        await ctx.audioWorklet.addModule('/phasezero-worklet.js?v=4');
         const node = new AudioWorkletNode(ctx, 'phasezero-worklet-processor', {
           numberOfInputs: 0,
           numberOfOutputs: 1,
@@ -180,6 +203,9 @@ class DualDeckAudioEngine {
               looperLoopBeats: typeof data.looperLoopBeats === 'number' ? data.looperLoopBeats : 4,
               looperPhaseErrorMs:
                 typeof data.looperPhaseErrorMs === 'number' ? data.looperPhaseErrorMs : 0,
+              deck1Playing: typeof data.deck1Playing === 'boolean' ? data.deck1Playing : false,
+              deck2Playing: typeof data.deck2Playing === 'boolean' ? data.deck2Playing : false,
+              looperPlaying: typeof data.looperPlaying === 'boolean' ? data.looperPlaying : false,
               receivedAtPerfMs: performance.now(),
             };
           }
@@ -187,6 +213,7 @@ class DualDeckAudioEngine {
         node.connect(ctx.destination);
         this.workletNode = node;
         this.workletReady = true;
+        this.lastSentBeatTimes = { 1: undefined, 2: undefined, looper: undefined };
 
         // Upload any already-loaded tracks & params into the worklet
         if (this.deck1Track) this.uploadTrackToWorklet(1, this.deck1Track);
@@ -216,6 +243,7 @@ class DualDeckAudioEngine {
       // Copy channel PCM cleanly so AudioBuffer on main thread remains intact for waveform rendering
       channels.push(new Float32Array(track.buffer.getChannelData(c)));
     }
+    this.lastSentBeatTimes[deck] = track.beatTimesSec;
     this.workletNode.port.postMessage({
       type: 'loadTrack',
       deck,
@@ -238,6 +266,8 @@ class DualDeckAudioEngine {
       channels.push(new Float32Array(track.buffer.getChannelData(c)));
     }
     const pendingGrid = this.pendingWorkletParams?.looperGrid;
+    const sentBt = pendingGrid?.beatTimesSec ?? track.beatTimesSec;
+    this.lastSentBeatTimes.looper = sentBt;
     this.workletNode.port.postMessage({
       type: 'loadLooperTrack',
       channels,
@@ -246,7 +276,7 @@ class DualDeckAudioEngine {
       durationSec: track.durationSec,
       bpm: pendingGrid?.bpm ?? track.exactBpm,
       anchorMs: pendingGrid?.anchorMs ?? track.firstTransientMs,
-      beatTimesSec: pendingGrid?.beatTimesSec ?? track.beatTimesSec,
+      beatTimesSec: sentBt,
       useBeatTimes: pendingGrid?.useBeatTimes ?? !track.isConstantTempo,
       startBeatOffset: pendingGrid?.startBeatOffset ?? 0,
       tempoMultiplier: pendingGrid?.tempoMultiplier ?? 1,
@@ -255,6 +285,7 @@ class DualDeckAudioEngine {
       active: pendingGrid?.active ?? this.looperActive,
       gain: pendingGrid?.gain ?? this.looperLevel,
       loopBeatsOverride: pendingGrid?.loopBeatsOverride ?? 0,
+      blendMode: pendingGrid?.blendMode ?? this.looperBlendMode,
     });
   }
 
@@ -268,10 +299,41 @@ class DualDeckAudioEngine {
 
   public updateWorkletParams(params: WorkletParamsPayload): void {
     this.pendingWorkletParams = params;
+    if (params.looperGrid?.blendMode) {
+      this.looperBlendMode = params.looperGrid.blendMode;
+      this.updateFallbackLooperFilter();
+    }
     if (!this.workletNode || !this.workletReady) return;
+
+    const payload: WorkletParamsPayload = { ...params };
+    if (params.deck1Grid) {
+      if (params.deck1Grid.beatTimesSec === this.lastSentBeatTimes[1]) {
+        const { beatTimesSec: _omit, ...rest } = params.deck1Grid;
+        payload.deck1Grid = rest;
+      } else {
+        this.lastSentBeatTimes[1] = params.deck1Grid.beatTimesSec;
+      }
+    }
+    if (params.deck2Grid) {
+      if (params.deck2Grid.beatTimesSec === this.lastSentBeatTimes[2]) {
+        const { beatTimesSec: _omit, ...rest } = params.deck2Grid;
+        payload.deck2Grid = rest;
+      } else {
+        this.lastSentBeatTimes[2] = params.deck2Grid.beatTimesSec;
+      }
+    }
+    if (params.looperGrid) {
+      if (params.looperGrid.beatTimesSec === this.lastSentBeatTimes.looper) {
+        const { beatTimesSec: _omit, ...rest } = params.looperGrid;
+        payload.looperGrid = rest;
+      } else {
+        this.lastSentBeatTimes.looper = params.looperGrid.beatTimesSec;
+      }
+    }
+
     this.workletNode.port.postMessage({
       type: 'setParams',
-      ...params,
+      ...payload,
     });
   }
 
@@ -279,6 +341,9 @@ class DualDeckAudioEngine {
     elapsedBeats: number;
     initialPhaseErrorMs: number;
     resetCounters?: boolean;
+    deck1Playing?: boolean;
+    deck2Playing?: boolean;
+    looperPlaying?: boolean;
   }): boolean {
     if (!this.isUsingWorklet() || !this.workletNode) return false;
     // Ensure BufferSource fallback is stopped when worklet takes ownership
@@ -288,6 +353,23 @@ class DualDeckAudioEngine {
       elapsedBeats: params.elapsedBeats,
       initialPhaseErrorMs: params.initialPhaseErrorMs,
       resetCounters: Boolean(params.resetCounters),
+      deck1Playing: typeof params.deck1Playing === 'boolean' ? params.deck1Playing : true,
+      deck2Playing: typeof params.deck2Playing === 'boolean' ? params.deck2Playing : true,
+      looperPlaying:
+        typeof params.looperPlaying === 'boolean'
+          ? params.looperPlaying
+          : (params.deck1Playing ?? true) || (params.deck2Playing ?? true),
+    });
+    return true;
+  }
+
+  public setWorkletDeckPlaying(deck: 1 | 2, playing: boolean, elapsedBeats?: number): boolean {
+    if (!this.isUsingWorklet() || !this.workletNode) return false;
+    this.workletNode.port.postMessage({
+      type: 'setDeckPlaying',
+      deck,
+      playing,
+      elapsedBeats,
     });
     return true;
   }
@@ -355,6 +437,58 @@ class DualDeckAudioEngine {
     this.deck2Gain.gain.setValueAtTime(g2, this.ctx.currentTime);
   }
 
+  private async analyzeAudioAsync(
+    buffer: AudioBuffer,
+    peakSamplesPerSec = 400
+  ): Promise<{ grid: ReturnType<typeof analyzeBeatGrid>; peaks: Float32Array }> {
+    const monoCopy = this.copyMonoForWorker(buffer);
+    if (typeof Worker !== 'undefined') {
+      try {
+        if (!this.analysisWorker) {
+          this.analysisWorker = new Worker(
+            new URL('../workers/analysisWorker.ts', import.meta.url),
+            { type: 'module' }
+          );
+        }
+        const worker = this.analysisWorker;
+        const id = ++this.workerReqId;
+        return await new Promise((resolve, reject) => {
+          const onMessage = (ev: MessageEvent) => {
+            const data = ev.data;
+            if (!data || data.id !== id) return;
+            cleanup();
+            if (data.error) {
+              reject(new Error(data.error));
+            } else {
+              resolve({ grid: data.grid, peaks: data.peaks });
+            }
+          };
+          const onError = (err: ErrorEvent) => {
+            cleanup();
+            reject(new Error(err.message || 'Worker analysis error'));
+          };
+          const cleanup = () => {
+            worker.removeEventListener('message', onMessage);
+            worker.removeEventListener('error', onError);
+          };
+          worker.addEventListener('message', onMessage);
+          worker.addEventListener('error', onError);
+          worker.postMessage(
+            { id, mono: monoCopy, sampleRate: buffer.sampleRate, peakSamplesPerSec },
+            [monoCopy.buffer]
+          );
+        });
+      } catch {
+        // Fallback smoothly to synchronous main-thread analysis if Worker fails to boot
+      }
+    }
+    const freshMono = this.mixDownToMono(buffer);
+    return {
+      grid: analyzeBeatGrid(freshMono, buffer.sampleRate),
+      peaks: computeWaveformPeaks(freshMono, buffer.sampleRate, peakSamplesPerSec),
+    };
+  }
+
   public async loadLocalFile(deck: 1 | 2, file: File): Promise<LoadedDeckTrack> {
     const ctx = this.ensureContext();
     if (!ctx) {
@@ -366,10 +500,8 @@ class DualDeckAudioEngine {
 
     const arrayBuffer = await file.arrayBuffer();
     const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-    const mono = this.mixDownToMono(audioBuffer);
-    const grid = analyzeBeatGrid(mono, audioBuffer.sampleRate);
     const peakSamplesPerSec = 400;
-    const peaks = computeWaveformPeaks(mono, audioBuffer.sampleRate, peakSamplesPerSec);
+    const { grid, peaks } = await this.analyzeAudioAsync(audioBuffer, peakSamplesPerSec);
 
     const track: LoadedDeckTrack = {
       name: file.name,
@@ -473,6 +605,7 @@ class DualDeckAudioEngine {
 
   public clearDeck(deck: 1 | 2): void {
     this.stopTrackSources();
+    this.lastSentBeatTimes[deck] = undefined;
     if (deck === 1) this.deck1Track = null;
     else this.deck2Track = null;
     if (this.workletNode && this.workletReady) {
@@ -491,10 +624,8 @@ class DualDeckAudioEngine {
 
     const arrayBuffer = await file.arrayBuffer();
     const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-    const mono = this.mixDownToMono(audioBuffer);
-    const grid = analyzeBeatGrid(mono, audioBuffer.sampleRate);
     const peakSamplesPerSec = 400;
-    const peaks = computeWaveformPeaks(mono, audioBuffer.sampleRate, peakSamplesPerSec);
+    const { grid, peaks } = await this.analyzeAudioAsync(audioBuffer, peakSamplesPerSec);
 
     const track: LoadedDeckTrack = {
       name: file.name,
@@ -587,6 +718,7 @@ class DualDeckAudioEngine {
 
   public clearLooper(): void {
     this.looperTrack = null;
+    this.lastSentBeatTimes.looper = undefined;
     if (this.looperSource) {
       try {
         this.looperSource.stop();
@@ -600,6 +732,22 @@ class DualDeckAudioEngine {
     if (this.workletNode && this.workletReady) {
       this.workletNode.port.postMessage({ type: 'clearLooper' });
     }
+  }
+
+  private updateFallbackLooperFilter(): void {
+    if (!this.ctx || !this.looperFilter) return;
+    const hasSongPlaying = Boolean(this.deck1Source || this.deck2Source);
+    const hz =
+      this.looperBlendMode === 'full'
+        ? 10
+        : this.looperBlendMode === 'top-260'
+          ? 260
+          : this.looperBlendMode === 'blend-140'
+            ? 140
+            : hasSongPlaying
+              ? 135
+              : 10;
+    this.looperFilter.frequency.setValueAtTime(hz, this.ctx.currentTime);
   }
 
   public setLooperGain(gain: number, active: boolean): void {
@@ -661,6 +809,8 @@ class DualDeckAudioEngine {
     deck2OffsetSec: number;
     deck1Rate: number;
     deck2Rate: number;
+    deck1Playing?: boolean;
+    deck2Playing?: boolean;
     deck1DetuneCents?: number;
     deck2DetuneCents?: number;
     looperOffsetSec?: number;
@@ -677,8 +827,10 @@ class DualDeckAudioEngine {
 
     this.stopFallbackSources();
     const baseStartAt = this.ctx.currentTime + 0.035;
+    const playD1 = params.deck1Playing ?? true;
+    const playD2 = params.deck2Playing ?? true;
 
-    if (this.deck1Track && this.deck1Track.buffer instanceof AudioBuffer) {
+    if (playD1 && this.deck1Track && this.deck1Track.buffer instanceof AudioBuffer) {
       const rate1 = Math.max(0.5, Math.min(2.0, params.deck1Rate));
       const dur1 = Math.max(0.01, this.deck1Track.durationSec);
       const start1 =
@@ -705,7 +857,7 @@ class DualDeckAudioEngine {
       };
     }
 
-    if (this.deck2Track && this.deck2Track.buffer instanceof AudioBuffer) {
+    if (playD2 && this.deck2Track && this.deck2Track.buffer instanceof AudioBuffer) {
       const rate2 = Math.max(0.5, Math.min(2.0, params.deck2Rate));
       const dur2 = Math.max(0.01, this.deck2Track.durationSec);
       const start2 =
@@ -735,7 +887,7 @@ class DualDeckAudioEngine {
     if (
       this.looperTrack &&
       this.looperTrack.buffer instanceof AudioBuffer &&
-      this.looperGain
+      this.looperFilter
     ) {
       const rateL = Math.max(0.5, Math.min(2.0, params.looperRate ?? 1));
       const durL = Math.max(0.01, this.looperTrack.durationSec);
@@ -756,7 +908,7 @@ class DualDeckAudioEngine {
       if (typeof params.looperDetuneCents === 'number') {
         srcL.detune.setValueAtTime(params.looperDetuneCents, startL);
       }
-      srcL.connect(this.looperGain);
+      srcL.connect(this.looperFilter);
       srcL.start(startL, offsetL);
       this.looperSource = srcL;
       this.looperCursor = {
@@ -768,6 +920,7 @@ class DualDeckAudioEngine {
         nextRate: rateL,
       };
     }
+    this.updateFallbackLooperFilter();
     this.lastResyncCtxTime = baseStartAt;
   }
 
@@ -954,6 +1107,19 @@ class DualDeckAudioEngine {
     osc.stop(startTime + 0.15);
   }
 
+  private copyMonoForWorker(buffer: AudioBuffer): Float32Array {
+    const ch0 = buffer.getChannelData(0);
+    if (buffer.numberOfChannels === 1) {
+      return new Float32Array(ch0);
+    }
+    const ch1 = buffer.getChannelData(1);
+    const mono = new Float32Array(buffer.length);
+    for (let i = 0; i < buffer.length; i++) {
+      mono[i] = (ch0[i] + ch1[i]) * 0.5;
+    }
+    return mono;
+  }
+
   private mixDownToMono(buffer: AudioBuffer): Float32Array {
     const ch0 = buffer.getChannelData(0);
     if (buffer.numberOfChannels === 1) return ch0;
@@ -969,6 +1135,10 @@ class DualDeckAudioEngine {
     this.stopTrackSources();
     this.enabled = false;
     this.workletReady = false;
+    if (this.analysisWorker) {
+      this.analysisWorker.terminate();
+      this.analysisWorker = null;
+    }
     if (this.workletNode) {
       try {
         this.workletNode.disconnect();

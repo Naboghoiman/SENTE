@@ -1,5 +1,5 @@
-import React, { useRef, useState } from 'react';
-import { Lock, Music, Trash2, Unlock, Upload } from 'lucide-react';
+import React, { memo, useEffect, useRef, useState } from 'react';
+import { Lock, Music, Pause, Play, Trash2, Unlock, Upload } from 'lucide-react';
 import { type MusicalKeyInfo, transposeKeyInfo } from '../utils/audioAnalysis';
 import { type LoadedDeckTrack } from '../utils/audioEngine';
 
@@ -21,13 +21,15 @@ interface DeckLoaderPanelProps {
   deck2: DeckUiInfo;
   crossfader: number;
   isSynced: boolean;
-  isPlaying: boolean;
-  elapsedBeats: number;
+  deck1Playing: boolean;
+  deck2Playing: boolean;
+  elapsedBeatsRef: React.MutableRefObject<number>;
   masterBpm: number;
   deck2RateTrimPct: number;
   livePhaseErrorMs: number;
   autoNudgeEnabled: boolean;
   maxNudgeTrimPct: number;
+  onToggleDeckPlay: (deck: 1 | 2) => void;
   onToggleSync: () => void;
   onToggleAutoNudge: () => void;
   onMaxNudgeTrimChange: (pct: number) => void;
@@ -56,7 +58,8 @@ function formatDuration(sec: number): string {
 interface SeratoPlatterProps {
   deckNum: 1 | 2;
   bpm: number;
-  elapsedBeats: number;
+  tempoMultiplier: 0.5 | 1 | 2;
+  elapsedBeatsRef: React.MutableRefObject<number>;
   isPlaying: boolean;
   accentHex: string;
   trimLabel: string;
@@ -65,13 +68,35 @@ interface SeratoPlatterProps {
 const SeratoPlatter: React.FC<SeratoPlatterProps> = ({
   deckNum,
   bpm,
-  elapsedBeats,
+  tempoMultiplier,
+  elapsedBeatsRef,
   isPlaying,
   accentHex,
   trimLabel,
 }) => {
-  // 1 beat = 90 degrees rotation (1 full 4-beat bar = 1 revolution, Serato virtual vinyl feel)
-  const angleDeg = (elapsedBeats * 90) % 360;
+  const needleRef = useRef<HTMLDivElement | null>(null);
+  const pausedAngleRef = useRef<number>(0);
+
+  useEffect(() => {
+    if (!isPlaying) {
+      if (needleRef.current) {
+        needleRef.current.style.transform = `rotate(${pausedAngleRef.current.toFixed(1)}deg)`;
+      }
+      return;
+    }
+
+    let rafId = 0;
+    const updateSpin = () => {
+      const angleDeg = (elapsedBeatsRef.current * tempoMultiplier * 90) % 360;
+      pausedAngleRef.current = angleDeg;
+      if (needleRef.current) {
+        needleRef.current.style.transform = `rotate(${angleDeg.toFixed(1)}deg)`;
+      }
+      rafId = window.requestAnimationFrame(updateSpin);
+    };
+    rafId = window.requestAnimationFrame(updateSpin);
+    return () => window.cancelAnimationFrame(rafId);
+  }, [isPlaying, tempoMultiplier, elapsedBeatsRef]);
 
   return (
     <div className="flex items-center gap-3.5 shrink-0">
@@ -84,9 +109,10 @@ const SeratoPlatter: React.FC<SeratoPlatterProps> = ({
         <div className="absolute inset-3 rounded-full border border-slate-800/80" />
 
         <div
+          ref={needleRef}
           className="absolute inset-0"
           style={{
-            transform: `rotate(${angleDeg.toFixed(1)}deg)`,
+            transform: `rotate(${pausedAngleRef.current.toFixed(1)}deg)`,
             transition: isPlaying ? 'none' : 'transform 120ms ease-out',
           }}
         >
@@ -129,9 +155,10 @@ interface SingleDeckCardProps {
   hasOppositeTrack: boolean;
   isSynced?: boolean;
   isPlaying: boolean;
-  elapsedBeats: number;
+  elapsedBeatsRef: React.MutableRefObject<number>;
   displayedBpm: number;
   trimLabel: string;
+  onTogglePlay: () => void;
   onToggleSync?: () => void;
   onManualPhaseNudge?: (deltaMs: number) => void;
   onSnapPhaseZero?: () => void;
@@ -158,9 +185,10 @@ const SingleDeckCard: React.FC<SingleDeckCardProps> = ({
   hasOppositeTrack,
   isSynced,
   isPlaying,
-  elapsedBeats,
+  elapsedBeatsRef,
   displayedBpm,
   trimLabel,
+  onTogglePlay,
   onToggleSync,
   onManualPhaseNudge,
   onSnapPhaseZero,
@@ -242,7 +270,24 @@ const SingleDeckCard: React.FC<SingleDeckCardProps> = ({
           <span className="font-medium text-slate-300 whitespace-nowrap">{roleLabel}</span>
         </div>
 
-        <div className="flex items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            onClick={onTogglePlay}
+            aria-pressed={isPlaying}
+            data-testid={`deck-${deckNum}-play-toggle`}
+            className={`inline-flex items-center gap-1.5 px-3 py-1 text-xs font-mono font-bold rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              isPlaying
+                ? deckNum === 1
+                  ? 'bg-sky-600 border-sky-400/70 text-white hover:bg-sky-500'
+                  : 'bg-emerald-600 border-emerald-400/70 text-white hover:bg-emerald-500'
+                : 'bg-[#1B212E] border-slate-600 text-slate-200 hover:bg-[#242C3D]'
+            }`}
+          >
+            {isPlaying ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
+            <span>{isPlaying ? `Pause D${deckNum}` : `Play D${deckNum}`}</span>
+          </button>
+
           {deckNum === 2 && onToggleSync && (
             <button
               type="button"
@@ -286,7 +331,8 @@ const SingleDeckCard: React.FC<SingleDeckCardProps> = ({
         <SeratoPlatter
           deckNum={deckNum}
           bpm={displayedBpm}
-          elapsedBeats={elapsedBeats}
+          tempoMultiplier={info.tempoMultiplier}
+          elapsedBeatsRef={elapsedBeatsRef}
           isPlaying={isPlaying}
           accentHex={accentHex}
           trimLabel={trimLabel}
@@ -676,18 +722,20 @@ const SingleDeckCard: React.FC<SingleDeckCardProps> = ({
   );
 };
 
-export const DeckLoaderPanel: React.FC<DeckLoaderPanelProps> = ({
+export const DeckLoaderPanel: React.FC<DeckLoaderPanelProps> = memo(({
   deck1,
   deck2,
   crossfader,
   isSynced,
-  isPlaying,
-  elapsedBeats,
+  deck1Playing,
+  deck2Playing,
+  elapsedBeatsRef,
   masterBpm,
   deck2RateTrimPct,
   livePhaseErrorMs,
   autoNudgeEnabled,
   maxNudgeTrimPct,
+  onToggleDeckPlay,
   onToggleSync,
   onToggleAutoNudge,
   onMaxNudgeTrimChange,
@@ -734,10 +782,11 @@ export const DeckLoaderPanel: React.FC<DeckLoaderPanelProps> = ({
           info={deck1}
           oppositeKey={d2EffectiveKey}
           hasOppositeTrack={Boolean(deck2.track)}
-          isPlaying={isPlaying}
-          elapsedBeats={elapsedBeats * deck1.tempoMultiplier}
+          isPlaying={deck1Playing}
+          elapsedBeatsRef={elapsedBeatsRef}
           displayedBpm={masterBpm * deck1.tempoMultiplier}
           trimLabel={deck1TrimLabel}
+          onTogglePlay={() => onToggleDeckPlay(1)}
           onLoadFile={(file) => onLoadFile(1, file)}
           onLoadDemo={() => onLoadDemo(1)}
           onClear={() => onClearDeck(1)}
@@ -759,10 +808,11 @@ export const DeckLoaderPanel: React.FC<DeckLoaderPanelProps> = ({
           oppositeKey={d1EffectiveKey}
           hasOppositeTrack={Boolean(deck1.track)}
           isSynced={isSynced}
-          isPlaying={isPlaying}
-          elapsedBeats={elapsedBeats * deck2.tempoMultiplier}
+          isPlaying={deck2Playing}
+          elapsedBeatsRef={elapsedBeatsRef}
           displayedBpm={masterBpm * deck2.tempoMultiplier * (1 + deck2RateTrimPct / 100)}
           trimLabel={deck2TrimLabel}
+          onTogglePlay={() => onToggleDeckPlay(2)}
           onToggleSync={onToggleSync}
           onManualPhaseNudge={onManualPhaseNudge}
           onSnapPhaseZero={onSnapPhaseZero}
@@ -860,4 +910,4 @@ export const DeckLoaderPanel: React.FC<DeckLoaderPanelProps> = ({
       </div>
     </section>
   );
-};
+});

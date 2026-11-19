@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { memo } from 'react';
 import { ArrowUpRight } from 'lucide-react';
 
 export interface GuideStep {
@@ -74,7 +74,7 @@ interface DjayGuideSectionProps {
   onSimulateScenario: (scenarioId: string) => void;
 }
 
-export const DjayGuideSection: React.FC<DjayGuideSectionProps> = ({
+export const DjayGuideSection: React.FC<DjayGuideSectionProps> = memo(({
   completedSteps,
   onToggleStep,
   onSimulateScenario,
@@ -209,4 +209,4 @@ export const DjayGuideSection: React.FC<DjayGuideSectionProps> = ({
       </div>
     </section>
   );
-};
+});

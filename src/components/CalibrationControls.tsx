@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { memo } from 'react';
 import {
   type CalibrationState,
   DIAGNOSTIC_SCENARIOS,
@@ -21,7 +21,7 @@ interface CalibrationControlsProps {
   onSnapToZero: () => void;
 }
 
-export const CalibrationControls: React.FC<CalibrationControlsProps> = ({
+export const CalibrationControls: React.FC<CalibrationControlsProps> = memo(({
   state,
   metrics,
   onSelectScenario,
@@ -271,4 +271,4 @@ export const CalibrationControls: React.FC<CalibrationControlsProps> = ({
       )}
     </aside>
   );
-};
+});

@@ -294,3 +294,24 @@ test('detectMusicalKey identifies Am (8A), C (8B), Dm (7A) and findOptimalSemito
   assert.equal(transposeKeyInfo(keyDm, shiftDmToAm).label, 'Am');
   assert.equal(transposeKeyInfo(keyDm, shiftDmToAm).camelot, '8A');
 });
+
+test('analyzeBeatGrid + computeWaveformPeaks analyzes a 120s 44.1kHz track quickly with <= 0.20 ms anchor precision', () => {
+  const sr = 44100;
+  const pcm = generateTestAudioPcm(126, 120, sr, 13.75, 'incoming');
+  const t0 = performance.now();
+  const grid = analyzeBeatGrid(pcm, sr);
+  const peaks = computeWaveformPeaks(pcm, sr, 400);
+  const elapsedMs = performance.now() - t0;
+
+  assert.equal(grid.exactBpm, 126);
+  assert.ok(
+    Math.abs(grid.firstTransientMs - 13.75) <= 0.2,
+    `Expected <= 0.20 ms anchor on 120s track, got ${grid.firstTransientMs} ms`
+  );
+  assert.ok(peaks.length === 120 * 400);
+  assert.ok(
+    elapsedMs < 4000,
+    `Expected fast non-freezing analysis (< 4000 ms) on 120s 44.1kHz PCM, took ${elapsedMs.toFixed(0)} ms`
+  );
+});
+

@@ -20,11 +20,36 @@ const PV_HS = 256;
 const PV_RING_SIZE = 8192;
 const PV_RING_MASK = PV_RING_SIZE - 1;
 const TWO_PI = Math.PI * 2;
+const HALF_PI = Math.PI * 0.5;
+const TRIG_LUT_SIZE = 4096;
+const TRIG_LUT_MASK = TRIG_LUT_SIZE - 1;
+const TRIG_SCALE = TRIG_LUT_SIZE / TWO_PI;
+
+function fastAtan2(y, x) {
+  if (x === 0) {
+    if (y > 0) return HALF_PI;
+    if (y < 0) return -HALF_PI;
+    return 0;
+  }
+  const ax = x < 0 ? -x : x;
+  const ay = y < 0 ? -y : y;
+  const mn = ax < ay ? ax : ay;
+  const mx = ax > ay ? ax : ay;
+  const a = mn / mx;
+  const s = a * a;
+  let r = ((-0.0464964749 * s + 0.15931422) * s - 0.327622764) * s * a + a;
+  if (ay > ax) r = HALF_PI - r;
+  if (x < 0) r = Math.PI - r;
+  return y < 0 ? -r : r;
+}
 
 class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.playing = false;
+    this.deck1Playing = false;
+    this.deck2Playing = false;
+    this.looperPlaying = false;
     this.masterBpm = 124.0;
     this.deck2TargetBpm = 124.0;
     this.syncMode = 'beat'; // 'off' | 'tempo' | 'beat'
@@ -77,16 +102,40 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
       this.binOmega[k] = (TWO_PI * k) / PV_N;
     }
 
+    this.trigCosLut = new Float64Array(TRIG_LUT_SIZE);
+    this.trigSinLut = new Float64Array(TRIG_LUT_SIZE);
+    for (let i = 0; i < TRIG_LUT_SIZE; i++) {
+      const ang = (TWO_PI * i) / TRIG_LUT_SIZE;
+      this.trigCosLut[i] = Math.cos(ang);
+      this.trigSinLut[i] = Math.sin(ang);
+    }
+
+    // Looper DJ Blend HPF biquad state (prevents sub-bass/kick clash when layered with a song)
+    this.looperHpCutoffHz = -1;
+    this.lpHpB0 = 1;
+    this.lpHpB1 = 0;
+    this.lpHpB2 = 0;
+    this.lpHpA1 = 0;
+    this.lpHpA2 = 0;
+    this.lpHpX1L = 0;
+    this.lpHpX2L = 0;
+    this.lpHpY1L = 0;
+    this.lpHpY2L = 0;
+    this.lpHpX1R = 0;
+    this.lpHpX2R = 0;
+    this.lpHpY1R = 0;
+    this.lpHpY2R = 0;
+
     // 4 ms cosine crossfade for click-free Deck 2 beat snap / manual nudge
     this.xfadeTotalSamples = Math.max(32, Math.round(sampleRate * 0.004));
     this.xfadeRemaining = 0;
     this.xfadeOldBeatPos = 0;
 
     this.decks = {
-      1: this.createEmptyDeck(),
-      2: this.createEmptyDeck(),
+      1: this.createEmptyDeck(0),
+      2: this.createEmptyDeck(0),
     };
-    this.looper = this.createEmptyLooper();
+    this.looper = this.createEmptyLooper(170);
 
     this.port.onmessage = (event) => {
       const msg = event.data;
@@ -122,7 +171,7 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
         }
         case 'clearDeck': {
           const deckNum = msg.deck === 2 ? 2 : 1;
-          this.decks[deckNum] = this.createEmptyDeck();
+          this.decks[deckNum] = this.createEmptyDeck(0);
           break;
         }
         case 'loadLooperTrack': {
@@ -156,12 +205,20 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
                   : 0.85,
             loopBeatsOverride:
               typeof msg.loopBeatsOverride === 'number' ? Math.max(0, msg.loopBeatsOverride) : 0,
+            blendMode:
+              typeof msg.blendMode === 'string'
+                ? msg.blendMode
+                : prev
+                  ? prev.blendMode
+                  : 'auto',
             pv,
           };
+          this.resetLooperFilterState();
           break;
         }
         case 'clearLooper': {
-          this.looper = this.createEmptyLooper();
+          this.looper = this.createEmptyLooper(170);
+          this.resetLooperFilterState();
           break;
         }
         case 'setParams': {
@@ -276,6 +333,9 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
               if (nextOv !== lp.loopBeatsOverride) needsPvReset = true;
               lp.loopBeatsOverride = nextOv;
             }
+            if (typeof patch.blendMode === 'string') {
+              lp.blendMode = patch.blendMode;
+            }
             if (needsPvReset) {
               this.resetPvState(lp.pv);
             }
@@ -285,6 +345,9 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
         case 'start': {
           const beat0 = typeof msg.elapsedBeats === 'number' ? msg.elapsedBeats : 0;
           const initOffsetMs = typeof msg.initialPhaseErrorMs === 'number' ? msg.initialPhaseErrorMs : 0;
+          const d1Play = typeof msg.deck1Playing === 'boolean' ? msg.deck1Playing : true;
+          const d2Play = typeof msg.deck2Playing === 'boolean' ? msg.deck2Playing : true;
+          const lpPlay = typeof msg.looperPlaying === 'boolean' ? msg.looperPlaying : d1Play || d2Play;
           this.masterBeatPos = beat0;
           this.deck2BeatPos = beat0 - (initOffsetMs / 1000) * (this.masterBpm / 60);
           this.integralErrSec = 0;
@@ -293,22 +356,98 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
           this.resetPvState(this.decks[1].pv);
           this.resetPvState(this.decks[2].pv);
           this.resetPvState(this.looper.pv);
+          this.resetLooperFilterState();
           if (msg.resetCounters) {
             this.hardSnapCount = 0;
             this.snappedRecentlyBlocks = 0;
           }
+          this.deck1Playing = d1Play;
+          this.deck2Playing = d2Play;
+          this.looperPlaying = lpPlay;
+          this.playing = this.deck1Playing || this.deck2Playing || this.looperPlaying;
+          this.emitTelemetry();
+          break;
+        }
+        case 'setDeckPlaying': {
+          const deckNum = msg.deck === 2 ? 2 : 1;
+          const wantPlay = Boolean(msg.playing);
+          const wasPlaying = this.playing;
+          const hasD1 = Boolean(this.decks[1] && this.decks[1].channels && this.decks[1].length > 1);
+          const hasD2 = Boolean(this.decks[2] && this.decks[2].channels && this.decks[2].length > 1);
+
+          if (!wantPlay) {
+            if (deckNum === 1) {
+              this.deck1Playing = false;
+              this.resetPvState(this.decks[1].pv);
+            } else {
+              this.deck2Playing = false;
+              this.resetPvState(this.decks[2].pv);
+            }
+            this.integralErrSec = 0;
+            this.currentRateTrimFrac = 0;
+            this.xfadeRemaining = 0;
+            if (!this.deck1Playing && !this.deck2Playing) {
+              this.looperPlaying = false;
+              this.playing = false;
+              this.resetPvState(this.looper.pv);
+              this.resetLooperFilterState();
+            } else {
+              this.playing = true;
+            }
+            this.emitTelemetry();
+            break;
+          }
+
+          // Turning a single deck ON
+          const beatFallback = typeof msg.elapsedBeats === 'number' ? msg.elapsedBeats : this.masterBeatPos;
+          const desiredBeats = (this.desiredOffsetMs / 1000) * (this.masterBpm / 60);
+
+          if (!wasPlaying) {
+            this.masterBeatPos = beatFallback;
+            this.deck2BeatPos = beatFallback - desiredBeats;
+            this.integralErrSec = 0;
+            this.currentRateTrimFrac = 0;
+            this.xfadeRemaining = 0;
+            this.resetPvState(this.looper.pv);
+            this.resetLooperFilterState();
+          }
+
+          if (deckNum === 1) {
+            // If Deck 2 is already playing & Beat Sync is on, align Deck 1 seamlessly onto Deck 2's bar/beat grid
+            if (wasPlaying && this.deck2Playing && hasD2 && this.syncMode === 'beat') {
+              this.masterBeatPos = this.deck2BeatPos + desiredBeats;
+              this.resetPvState(this.looper.pv);
+            }
+            this.resetPvState(this.decks[1].pv);
+            this.deck1Playing = true;
+          } else {
+            // If Deck 1 (or Looper) is already playing & Beat Sync is on, drop Deck 2 in locked at 0.00 ms
+            if (wasPlaying && (this.deck1Playing || this.looperPlaying) && (hasD1 || this.looperPlaying) && this.syncMode === 'beat') {
+              this.deck2BeatPos = this.masterBeatPos - desiredBeats;
+            }
+            this.resetPvState(this.decks[2].pv);
+            this.integralErrSec = 0;
+            this.currentRateTrimFrac = 0;
+            this.deck2Playing = true;
+          }
+          this.looperPlaying = true;
           this.playing = true;
           this.emitTelemetry();
           break;
         }
         case 'stop': {
           this.playing = false;
+          this.deck1Playing = false;
+          this.deck2Playing = false;
+          this.looperPlaying = false;
           this.integralErrSec = 0;
           this.currentRateTrimFrac = 0;
           this.xfadeRemaining = 0;
           this.resetPvState(this.decks[1].pv);
           this.resetPvState(this.decks[2].pv);
           this.resetPvState(this.looper.pv);
+          this.resetLooperFilterState();
+          this.emitTelemetry();
           break;
         }
         case 'seek': {
@@ -356,10 +495,11 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
     };
   }
 
-  createPvState() {
+  createPvState(initPhaseOffset = 0) {
     return {
       initialized: false,
-      uRead: 0,
+      initPhaseOffset,
+      uRead: initPhaseOffset,
       nextFrameIdx: -4,
       prevBeatCenter: 0,
       hasPrev: false,
@@ -393,7 +533,7 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
   resetPvState(pv) {
     if (!pv) return;
     pv.initialized = false;
-    pv.uRead = 0;
+    pv.uRead = pv.initPhaseOffset || 0;
     pv.nextFrameIdx = -4;
     pv.prevBeatCenter = 0;
     pv.hasPrev = false;
@@ -401,7 +541,7 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
     pv.framesSinceTransient = 8;
   }
 
-  createEmptyDeck() {
+  createEmptyDeck(initPhaseOffset = 0) {
     return {
       channels: null,
       length: 0,
@@ -416,15 +556,52 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
       keyLock: true,
       keyShiftSemitones: 0,
       loopBeatsOverride: 0,
-      pv: this.createPvState(),
+      pv: this.createPvState(initPhaseOffset),
     };
   }
 
-  createEmptyLooper() {
-    const deck = this.createEmptyDeck();
+  createEmptyLooper(initPhaseOffset = 170) {
+    const deck = this.createEmptyDeck(initPhaseOffset);
     deck.active = true;
     deck.gain = 0.85;
+    deck.blendMode = 'auto';
     return deck;
+  }
+
+  resetLooperFilterState() {
+    this.lpHpX1L = 0;
+    this.lpHpX2L = 0;
+    this.lpHpY1L = 0;
+    this.lpHpY2L = 0;
+    this.lpHpX1R = 0;
+    this.lpHpX2R = 0;
+    this.lpHpY1R = 0;
+    this.lpHpY2R = 0;
+  }
+
+  updateLooperHpfCoeffs(cutoffHz) {
+    if (this.looperHpCutoffHz === cutoffHz) return;
+    this.looperHpCutoffHz = cutoffHz;
+    if (cutoffHz <= 0 || sampleRate <= cutoffHz * 2.2) {
+      this.lpHpB0 = 1;
+      this.lpHpB1 = 0;
+      this.lpHpB2 = 0;
+      this.lpHpA1 = 0;
+      this.lpHpA2 = 0;
+      return;
+    }
+    const omega = (TWO_PI * cutoffHz) / sampleRate;
+    const cosO = Math.cos(omega);
+    const sinO = Math.sin(omega);
+    const alpha = sinO / Math.SQRT2;
+    const a0 = 1 + alpha;
+    const invA0 = 1 / a0;
+    this.lpHpB0 = ((1 + cosO) * 0.5) * invA0;
+    this.lpHpB1 = -(1 + cosO) * invA0;
+    this.lpHpB2 = this.lpHpB0;
+    this.lpHpA1 = (-2 * cosO) * invA0;
+    this.lpHpA2 = (1 - alpha) * invA0;
+    this.resetLooperFilterState();
   }
 
   wrapHalfBeat(deltaBeats) {
@@ -613,28 +790,52 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
     const anaR = pv.anaR;
 
     // 1. Sample source window symmetrically around beatCenter: [-N/2 .. +N/2 - 1]
-    // Fast direct sequential read when window sits strictly inside straight constant-tempo interior
-    const centerTimeSec = deck.anchorSec + wrappedBeatCenter * beatSec;
-    const centerSample = centerTimeSec * deck.sampleRate;
-    const startSample = centerSample - PV_HALF_N;
-    if (
-      !deck.useBeatTimes &&
+    // Fast direct sequential read whenever window sits strictly inside interior (both Straight & Dynamic grids)
+    const interior =
       wrappedBeatCenter > windowSpanBeats + 0.01 &&
-      wrappedBeatCenter < loopBeats - windowSpanBeats - 0.01 &&
-      startSample >= 1 &&
-      startSample + PV_N < deckLen - 2
-    ) {
-      const baseIdx = Math.floor(startSample);
-      const frac = startSample - baseIdx;
-      const oneMinusFrac = 1 - frac;
-      for (let n = 0; n < PV_N; n++) {
-        const idx = baseIdx + n;
-        const win = w[n];
-        const sL = (chL[idx] * oneMinusFrac + chL[idx + 1] * frac) * win;
-        anaL[n] = sL;
-        anaR[n] = hasStereo ? (chR[idx] * oneMinusFrac + chR[idx + 1] * frac) * win : sL;
+      wrappedBeatCenter < loopBeats - windowSpanBeats - 0.01;
+    let usedFastRead = false;
+
+    if (interior && !deck.useBeatTimes) {
+      const centerSample = (deck.anchorSec + wrappedBeatCenter * beatSec) * deck.sampleRate;
+      const startSample = centerSample - PV_HALF_N;
+      if (startSample >= 1 && startSample + PV_N < deckLen - 2) {
+        const baseIdx = Math.floor(startSample);
+        const frac = startSample - baseIdx;
+        const oneMinusFrac = 1 - frac;
+        for (let n = 0; n < PV_N; n++) {
+          const idx = baseIdx + n;
+          const win = w[n];
+          const sL = (chL[idx] * oneMinusFrac + chL[idx + 1] * frac) * win;
+          anaL[n] = sL;
+          anaR[n] = hasStereo ? (chR[idx] * oneMinusFrac + chR[idx + 1] * frac) * win : sL;
+        }
+        usedFastRead = true;
       }
-    } else {
+    } else if (interior && deck.useBeatTimes) {
+      const tWinStart = this.getTrackTimeSecAtShiftedBeat(deck, wrappedBeatCenter - windowSpanBeats);
+      const tWinEnd = this.getTrackTimeSecAtShiftedBeat(deck, wrappedBeatCenter + windowSpanBeats);
+      const sStart = tWinStart * deck.sampleRate;
+      const sEnd = tWinEnd * deck.sampleRate;
+      if (sStart >= 1 && sEnd > sStart && sEnd < deckLen - 2) {
+        const step = (sEnd - sStart) / PV_N;
+        let pos = sStart;
+        for (let n = 0; n < PV_N; n++) {
+          const idx = pos | 0;
+          const frac = pos - idx;
+          const win = w[n];
+          const sL = (chL[idx] + frac * (chL[idx + 1] - chL[idx])) * win;
+          anaL[n] = sL;
+          anaR[n] = hasStereo
+            ? (chR[idx] + frac * (chR[idx + 1] - chR[idx])) * win
+            : sL;
+          pos += step;
+        }
+        usedFastRead = true;
+      }
+    }
+
+    if (!usedFastRead) {
       for (let n = 0; n < PV_N; n++) {
         const b = beatCenter + (n - PV_HALF_N) * beatsPerSourceSample;
         const win = w[n];
@@ -668,14 +869,14 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
     imL[0] = 0;
     reR[0] = fftIm[0];
     imR[0] = 0;
-    mag[0] = Math.hypot(fftRe[0], fftIm[0]);
+    mag[0] = Math.sqrt(fftRe[0] * fftRe[0] + fftIm[0] * fftIm[0]);
     anaPhase[0] = 0;
 
     reL[PV_HALF_N] = fftRe[PV_HALF_N];
     imL[PV_HALF_N] = 0;
     reR[PV_HALF_N] = fftIm[PV_HALF_N];
     imR[PV_HALF_N] = 0;
-    mag[PV_HALF_N] = Math.hypot(fftRe[PV_HALF_N], fftIm[PV_HALF_N]);
+    mag[PV_HALF_N] = Math.sqrt(fftRe[PV_HALF_N] * fftRe[PV_HALF_N] + fftIm[PV_HALF_N] * fftIm[PV_HALF_N]);
     anaPhase[PV_HALF_N] = 0;
 
     for (let k = 1; k < PV_HALF_N; k++) {
@@ -697,17 +898,22 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
 
       const pL = lRe * lRe + lIm * lIm;
       const pR = rRe * rRe + rIm * rIm;
-      mag[k] = Math.sqrt(pL + pR);
+      const pTot = pL + pR;
+      mag[k] = Math.sqrt(pTot);
 
-      // Coherent stereo reference phase (avoid anti-phase cancellation)
-      const sRe = lRe + rRe;
-      const sIm = lIm + rIm;
-      if (sRe * sRe + sIm * sIm >= 0.25 * (pL + pR)) {
-        anaPhase[k] = Math.atan2(sIm, sRe);
-      } else if (pL >= pR) {
-        anaPhase[k] = Math.atan2(lIm, lRe);
+      if (pTot < 1e-16) {
+        anaPhase[k] = 0;
       } else {
-        anaPhase[k] = Math.atan2(rIm, rRe);
+        // Coherent stereo reference phase (avoid anti-phase cancellation)
+        const sRe = lRe + rRe;
+        const sIm = lIm + rIm;
+        if (sRe * sRe + sIm * sIm >= 0.25 * pTot) {
+          anaPhase[k] = fastAtan2(sIm, sRe);
+        } else if (pL >= pR) {
+          anaPhase[k] = fastAtan2(lIm, lRe);
+        } else {
+          anaPhase[k] = fastAtan2(rIm, rRe);
+        }
       }
     }
 
@@ -769,8 +975,9 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
         synthPhase[curPeak] = nextSynth;
         peakRot = nextSynth - anaPhase[curPeak];
       }
-      let c = Math.cos(peakRot);
-      let s = Math.sin(peakRot);
+      let lutIdx = Math.round(peakRot * TRIG_SCALE) & TRIG_LUT_MASK;
+      let c = this.trigCosLut[lutIdx];
+      let s = this.trigSinLut[lutIdx];
 
       for (let k = 1; k < PV_HALF_N; k++) {
         if (k > nextMid && pIdx + 1 < peakCount) {
@@ -786,8 +993,9 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
           nextSynth -= TWO_PI * Math.round(nextSynth * invTwoPi);
           synthPhase[curPeak] = nextSynth;
           peakRot = nextSynth - anaPhase[curPeak];
-          c = Math.cos(peakRot);
-          s = Math.sin(peakRot);
+          lutIdx = Math.round(peakRot * TRIG_SCALE) & TRIG_LUT_MASK;
+          c = this.trigCosLut[lutIdx];
+          s = this.trigSinLut[lutIdx];
         }
 
         let lockedSynth = anaPhase[k] + peakRot;
@@ -855,7 +1063,7 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
 
     this.runFft(fftRe, fftIm, true);
 
-    // 7. Undo zero-phase fftshift & COLA overlap-add (0.25 * w[n] gives exact 1.0 sum across 8 hops)
+    // 7. Undo zero-phase fftshift & COLA overlap-add (0.25 * w[n] gives exact 1.0 sum across 8 hops at HS=256)
     const ringL = pv.ringL;
     const ringR = pv.ringR;
     const baseOut = uCenter - PV_HALF_N;
@@ -911,7 +1119,7 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
     if (!pv.initialized) {
       pv.ringL.fill(0);
       pv.ringR.fill(0);
-      pv.uRead = 0;
+      pv.uRead = pv.initPhaseOffset || 0;
       pv.nextFrameIdx = -4;
       pv.prevBeatCenter = shiftedBeat;
       pv.hasPrev = false;
@@ -1024,6 +1232,9 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
       looperBeatPos,
       looperLoopBeats,
       looperPhaseErrorMs: 0,
+      deck1Playing: this.deck1Playing,
+      deck2Playing: this.deck2Playing,
+      looperPlaying: this.looperPlaying,
     });
   }
 
@@ -1047,14 +1258,42 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
     const hasD1 = Boolean(d1 && d1.channels && d1.length > 1);
     const hasD2 = Boolean(d2 && d2.channels && d2.length > 1);
     const hasLooper = Boolean(lp && lp.channels && lp.length > 1);
+    const d1Active = hasD1 && this.deck1Playing;
+    const d2Active = hasD2 && this.deck2Playing;
 
     const g1 = this.crossfader <= 0 ? 0.85 : Math.max(0, 0.85 * (1 - this.crossfader));
     const g2 = this.crossfader >= 0 ? 0.85 : Math.max(0, 0.85 * (1 + this.crossfader));
     const looperGain = lp && lp.active ? Math.max(0, Math.min(1.5, lp.gain)) : 0;
+    const lpActive =
+      hasLooper &&
+      looperGain > 0.0005 &&
+      (this.looperPlaying || this.deck1Playing || this.deck2Playing);
+
+    // DJ Looper Acoustic Blend EQ: automatically clears < 135 Hz sub-bass/kick clash
+    // whenever a song deck is playing so the loop glues transparently into the mix.
+    const songDeckAudible = (d1Active && g1 > 0.02) || (d2Active && g2 > 0.02);
+    const blendMode = (lp && lp.blendMode) || 'auto';
+    const targetCutoffHz =
+      blendMode === 'full'
+        ? 0
+        : blendMode === 'top-260'
+          ? 260
+          : blendMode === 'blend-140'
+            ? 140
+            : songDeckAudible
+              ? 135
+              : 0;
+    this.updateLooperHpfCoeffs(targetCutoffHz);
+    const useLooperHp = this.looperHpCutoffHz > 0;
+    const b0 = this.lpHpB0;
+    const b1 = this.lpHpB1;
+    const b2 = this.lpHpB2;
+    const a1 = this.lpHpA1;
+    const a2 = this.lpHpA2;
 
     const dtBlockSec = blockFrames / sampleRate;
     const nudgeActive =
-      this.syncMode === 'beat' && this.autoNudgeEnabled && hasD1 && hasD2;
+      this.syncMode === 'beat' && this.autoNudgeEnabled && d1Active && d2Active;
 
     if (this.snappedRecentlyBlocks > 0) {
       this.snappedRecentlyBlocks--;
@@ -1114,11 +1353,13 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
       ? (this.masterBpm * (lp.tempoMultiplier || 1)) / Math.max(40, lp.bpm)
       : 1;
 
+    const advanceMaster = this.deck1Playing || this.deck2Playing || lpActive;
+
     for (let i = 0; i < blockFrames; i++) {
       let l = 0;
       let r = 0;
 
-      if (hasD1) {
+      if (d1Active) {
         this.sampleDeckStereoWithKey(
           d1,
           this.masterBeatPos,
@@ -1131,7 +1372,7 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
         r += this.stereoBuf1[1] * g1;
       }
 
-      if (hasD2) {
+      if (d2Active) {
         this.sampleDeckStereoWithKey(
           d2,
           this.deck2BeatPos,
@@ -1165,7 +1406,7 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
         r += d2R * g2;
       }
 
-      if (hasLooper && looperGain > 0.0005) {
+      if (lpActive) {
         this.sampleDeckStereoWithKey(
           lp,
           this.masterBeatPos,
@@ -1174,15 +1415,43 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
           this.stereoBufLooper,
           true
         );
-        l += this.stereoBufLooper[0] * looperGain;
-        r += this.stereoBufLooper[1] * looperGain;
+        let lpL = this.stereoBufLooper[0];
+        let lpR = this.stereoBufLooper[1];
+        if (useLooperHp) {
+          const yL = b0 * lpL + b1 * this.lpHpX1L + b2 * this.lpHpX2L - a1 * this.lpHpY1L - a2 * this.lpHpY2L;
+          this.lpHpX2L = this.lpHpX1L;
+          this.lpHpX1L = lpL;
+          this.lpHpY2L = this.lpHpY1L;
+          this.lpHpY1L = yL;
+          lpL = yL;
+
+          const yR = b0 * lpR + b1 * this.lpHpX1R + b2 * this.lpHpX2R - a1 * this.lpHpY1R - a2 * this.lpHpY2R;
+          this.lpHpX2R = this.lpHpX1R;
+          this.lpHpX1R = lpR;
+          this.lpHpY2R = this.lpHpY1R;
+          this.lpHpY1R = yR;
+          lpR = yR;
+        }
+        l += lpL * looperGain;
+        r += lpR * looperGain;
       }
+
+      // Soft-knee transparent master limiter above 0.89 so Deck + Looper sums never digitally clip
+      if (l > 0.89) l = 0.89 + 0.1 * Math.tanh((l - 0.89) * 10);
+      else if (l < -0.89) l = -0.89 - 0.1 * Math.tanh((-l - 0.89) * 10);
+
+      if (r > 0.89) r = 0.89 + 0.1 * Math.tanh((r - 0.89) * 10);
+      else if (r < -0.89) r = -0.89 - 0.1 * Math.tanh((-r - 0.89) * 10);
 
       outL[i] = l;
       if (outR !== outL) outR[i] = r;
 
-      this.masterBeatPos += d1StepPerSample;
-      this.deck2BeatPos += d2StepPerSample;
+      if (advanceMaster) {
+        this.masterBeatPos += d1StepPerSample;
+      }
+      if (this.deck2Playing) {
+        this.deck2BeatPos += d2StepPerSample;
+      }
     }
 
     this.telemetryAccum += blockFrames;
