@@ -13,16 +13,23 @@ import { type LoadedDeckTrack } from '../utils/audioEngine';
 export interface LoadedTracksRefPayload {
   deck1: LoadedDeckTrack | null;
   deck2: LoadedDeckTrack | null;
+  looper?: LoadedDeckTrack | null;
   deck1Bpm: number;
   deck2Bpm: number;
+  looperBpm?: number;
   deck1AnchorMs: number;
   deck2AnchorMs: number;
+  looperAnchorMs?: number;
   deck1BeatTimes: number[];
   deck2BeatTimes: number[];
   deck1StartBeat?: number;
   deck2StartBeat?: number;
+  looperStartBeat?: number;
   deck1TempoMult?: 0.5 | 1 | 2;
   deck2TempoMult?: 0.5 | 1 | 2;
+  looperTempoMult?: 0.5 | 1 | 2;
+  looperLoopBeats?: number;
+  looperActive?: boolean;
 }
 
 interface PhaseCanvasStageProps {
@@ -115,9 +122,17 @@ export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = ({
       const meterHeight = 68;
       const waveTop = meterHeight + 10;
       const waveHeight = height - waveTop - 16;
-      const deck1CenterY = waveTop + waveHeight * 0.28;
-      const deck2CenterY = waveTop + waveHeight * 0.72;
-      const waveAmp = Math.max(26, waveHeight * 0.19);
+      const hasLooperLane = Boolean(tracks.looper && tracks.looper.peaks.length > 0);
+      const deck1CenterY = hasLooperLane
+        ? waveTop + waveHeight * 0.21
+        : waveTop + waveHeight * 0.28;
+      const deck2CenterY = hasLooperLane
+        ? waveTop + waveHeight * 0.51
+        : waveTop + waveHeight * 0.72;
+      const looperCenterY = waveTop + waveHeight * 0.82;
+      const waveAmp = hasLooperLane
+        ? Math.max(17, waveHeight * 0.125)
+        : Math.max(26, waveHeight * 0.19);
       const playheadX = Math.floor(width * 0.35);
 
       ctx.fillStyle = '#0E121B';
@@ -253,7 +268,10 @@ export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = ({
       // Deck baselines
       ctx.strokeStyle = 'rgba(148, 163, 184, 0.14)';
       ctx.lineWidth = 1;
-      [deck1CenterY, deck2CenterY].forEach((cy) => {
+      const baselines = hasLooperLane
+        ? [deck1CenterY, deck2CenterY, looperCenterY]
+        : [deck1CenterY, deck2CenterY];
+      baselines.forEach((cy) => {
         ctx.beginPath();
         ctx.moveTo(0, cy);
         ctx.lineTo(width, cy);
@@ -268,7 +286,7 @@ export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = ({
       ctx.fillText(
         `DECK 1 · ${d1Label} (${st.masterBpm.toFixed(2)} BPM)`,
         14,
-        deck1CenterY - waveAmp - 6
+        deck1CenterY - waveAmp - 5
       );
 
       const deck2Color =
@@ -282,8 +300,20 @@ export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = ({
       ctx.fillText(
         `DECK 2 · ${d2Label} (${currentMetrics.effectiveDeck2Bpm.toFixed(2)} BPM)`,
         14,
-        deck2CenterY - waveAmp - 6
+        deck2CenterY - waveAmp - 5
       );
+
+      if (hasLooperLane && tracks.looper) {
+        const lpActive = tracks.looperActive !== false;
+        ctx.fillStyle = lpActive ? '#A78BFA' : '#64748B';
+        const lpLabel = tracks.looper.name.slice(0, 28);
+        const lpStatus = lpActive ? '0.00 ms LOCK' : 'MUTED';
+        ctx.fillText(
+          `LOOPER · ${lpLabel} (${(st.masterBpm * (tracks.looperTempoMult ?? 1)).toFixed(2)} BPM · ${lpStatus})`,
+          14,
+          looperCenterY - waveAmp - 5
+        );
+      }
 
       // Draw Deck 1 Waveform
       ctx.strokeStyle = '#38BDF8';
@@ -363,6 +393,40 @@ export const PhaseCanvasStage: React.FC<PhaseCanvasStageProps> = ({
         ctx.lineTo(gx, deck2CenterY + waveAmp);
         ctx.stroke();
         ctx.setLineDash([]);
+      }
+
+      // Draw Looper Slot Waveform (strictly phase-locked 0.00 ms to Deck 1 Master Clock)
+      if (hasLooperLane && tracks.looper) {
+        const lp = tracks.looper;
+        const lpActive = tracks.looperActive !== false;
+        const lpBeatSec = 60 / Math.max(40, tracks.looperBpm ?? st.masterBpm);
+        const lpLoopBeats = Math.max(0.25, tracks.looperLoopBeats ?? 16);
+        const lpAnchorSec = (tracks.looperAnchorMs ?? 0) / 1000;
+
+        ctx.strokeStyle = lpActive ? '#A78BFA' : '#475569';
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        for (let x = 0; x < width; x += 2) {
+          const beatAtX = startBeat + x / pxPerBeat;
+          const lpRawBeat =
+            beatAtX * (tracks.looperTempoMult ?? 1) + (tracks.looperStartBeat ?? 0);
+          const lpWrappedBeat = ((lpRawBeat % lpLoopBeats) + lpLoopBeats) % lpLoopBeats;
+          const lpTimeSec = lpAnchorSec + lpWrappedBeat * lpBeatSec;
+          const sample =
+            lpTimeSec <= lp.durationSec
+              ? sampleTrackPeak(lp.peaks, lp.peakSamplesPerSec, lpTimeSec)
+              : 0;
+          const y = looperCenterY - sample * waveAmp;
+          if (x === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+
+        for (let b = firstWholeBeat; b <= lastWholeBeat; b++) {
+          const gx = (b - startBeat) * pxPerBeat;
+          ctx.fillStyle = lpActive ? '#A78BFA' : '#64748B';
+          ctx.fillRect(gx - 1, looperCenterY - waveAmp, 2, waveAmp * 2);
+        }
       }
 
       // Playhead Needle

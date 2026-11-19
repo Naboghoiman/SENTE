@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { TopBar } from './components/TopBar';
 import { DeckLoaderPanel, type DeckUiInfo } from './components/DeckLoaderPanel';
+import { AudioLooperSlot, type LooperUiInfo } from './components/AudioLooperSlot';
 import { PhaseCanvasStage, type LoadedTracksRefPayload } from './components/PhaseCanvasStage';
 import { CalibrationControls } from './components/CalibrationControls';
 import { DjayGuideSection } from './components/DjayGuideSection';
@@ -10,7 +11,12 @@ import {
   matchRhythmicStartingPoint,
   transposeKeyInfo,
 } from './utils/audioAnalysis';
-import { audioEngine, type LoadedDeckTrack, type WorkletParamsPayload } from './utils/audioEngine';
+import {
+  audioEngine,
+  computeDetectedLoopBeats,
+  type LoadedDeckTrack,
+  type WorkletParamsPayload,
+} from './utils/audioEngine';
 import {
   type CalibrationState,
   computePhaseMetrics,
@@ -52,6 +58,13 @@ const EMPTY_DECK: DeckUiInfo = {
   rhythmMatchPct: null,
   keyLock: true,
   keyShiftSemitones: 0,
+};
+
+const EMPTY_LOOPER: LooperUiInfo = {
+  ...EMPTY_DECK,
+  active: true,
+  gain: 0.85,
+  loopBeatsOverride: 0,
 };
 
 function computeSoloStartBeat(track: LoadedDeckTrack): number {
@@ -149,10 +162,13 @@ export default function App() {
 
   const [deck1, setDeck1] = useState<DeckUiInfo>(EMPTY_DECK);
   const [deck2, setDeck2] = useState<DeckUiInfo>(EMPTY_DECK);
+  const [looper, setLooper] = useState<LooperUiInfo>(EMPTY_LOOPER);
   const [crossfader, setCrossfader] = useState<number>(0);
 
   const stateRef = useRef<CalibrationState>(INITIAL_STATE);
   stateRef.current = state;
+  const elapsedBeatsRef = useRef<number>(INITIAL_STATE.elapsedBeats);
+  elapsedBeatsRef.current = state.elapsedBeats;
 
   const autoNudgeRef = useRef<boolean>(true);
   autoNudgeRef.current = autoNudgeEnabled;
@@ -165,8 +181,10 @@ export default function App() {
 
   const deck1Bpm = deck1.manualBpm ?? deck1.track?.exactBpm ?? state.masterBpm;
   const deck2Bpm = deck2.manualBpm ?? deck2.track?.exactBpm ?? state.masterBpm;
+  const looperBpm = looper.manualBpm ?? looper.track?.exactBpm ?? state.masterBpm;
   const deck1AnchorMs = deck1.manualAnchorMs ?? deck1.track?.firstTransientMs ?? 0;
   const deck2AnchorMs = deck2.manualAnchorMs ?? deck2.track?.firstTransientMs ?? 0;
+  const looperAnchorMs = looper.manualAnchorMs ?? looper.track?.firstTransientMs ?? 0;
 
   const deck1BeatTimes = useMemo(
     () => getAdjustedBeatTimes(deck1.track, deck1Bpm, deck1AnchorMs),
@@ -176,40 +194,66 @@ export default function App() {
     () => getAdjustedBeatTimes(deck2.track, deck2Bpm, deck2AnchorMs),
     [deck2.track, deck2Bpm, deck2AnchorMs]
   );
+  const looperBeatTimes = useMemo(
+    () => getAdjustedBeatTimes(looper.track, looperBpm, looperAnchorMs),
+    [looper.track, looperBpm, looperAnchorMs]
+  );
+
+  const looperEffectiveLoopBeats = useMemo(() => {
+    if (!looper.track) return 16;
+    if (looper.loopBeatsOverride > 0) return looper.loopBeatsOverride;
+    return computeDetectedLoopBeats(looper.track.durationSec, looperBpm, looperAnchorMs);
+  }, [looper.track, looper.loopBeatsOverride, looperBpm, looperAnchorMs]);
 
   const deck1Ref = useRef<DeckUiInfo>(deck1);
   deck1Ref.current = deck1;
   const deck2Ref = useRef<DeckUiInfo>(deck2);
   deck2Ref.current = deck2;
+  const looperRef = useRef<LooperUiInfo>(looper);
+  looperRef.current = looper;
 
   const tracksRef = useRef<LoadedTracksRefPayload>({
     deck1: null,
     deck2: null,
+    looper: null,
     deck1Bpm,
     deck2Bpm,
+    looperBpm,
     deck1AnchorMs,
     deck2AnchorMs,
+    looperAnchorMs,
     deck1BeatTimes,
     deck2BeatTimes,
     deck1StartBeat: 0,
     deck2StartBeat: 0,
+    looperStartBeat: 0,
     deck1TempoMult: 1,
     deck2TempoMult: 1,
+    looperTempoMult: 1,
+    looperLoopBeats: 16,
+    looperActive: true,
   });
 
   tracksRef.current = {
     deck1: deck1.track,
     deck2: deck2.track,
+    looper: looper.track,
     deck1Bpm,
     deck2Bpm,
+    looperBpm,
     deck1AnchorMs,
     deck2AnchorMs,
+    looperAnchorMs,
     deck1BeatTimes,
     deck2BeatTimes,
     deck1StartBeat: deck1.startBeatOffset,
     deck2StartBeat: deck2.startBeatOffset,
+    looperStartBeat: looper.startBeatOffset,
     deck1TempoMult: deck1.tempoMultiplier,
     deck2TempoMult: deck2.tempoMultiplier,
+    looperTempoMult: looper.tempoMultiplier,
+    looperLoopBeats: looperEffectiveLoopBeats,
+    looperActive: looper.active,
   };
 
   const metrics = useMemo(() => computePhaseMetrics(state), [state]);
@@ -245,6 +289,13 @@ export default function App() {
       );
       const useTracked2 = Boolean(
         t.deck2 && (!t.deck2.isConstantTempo || curState.gridMode === 'dynamic')
+      );
+      const lpCur = looperRef.current;
+      const lpBpm = lpCur.manualBpm ?? lpCur.track?.exactBpm ?? curState.masterBpm;
+      const lpAnchorMs = lpCur.manualAnchorMs ?? lpCur.track?.firstTransientMs ?? 0;
+      const lpBeatTimes = getAdjustedBeatTimes(lpCur.track, lpBpm, lpAnchorMs);
+      const useTrackedLooper = Boolean(
+        lpCur.track && (!lpCur.track.isConstantTempo || curState.gridMode === 'dynamic')
       );
       const deck2TargetBpm =
         curState.syncMode !== 'off'
@@ -284,6 +335,21 @@ export default function App() {
               tempoMultiplier: deck2Ref.current.tempoMultiplier,
               keyLock: deck2Ref.current.keyLock,
               keyShiftSemitones: deck2Ref.current.keyShiftSemitones,
+            }
+          : undefined,
+        looperGrid: lpCur.track
+          ? {
+              bpm: lpBpm,
+              anchorMs: lpAnchorMs,
+              useBeatTimes: useTrackedLooper,
+              beatTimesSec: lpBeatTimes,
+              startBeatOffset: lpCur.startBeatOffset,
+              tempoMultiplier: lpCur.tempoMultiplier,
+              keyLock: lpCur.keyLock,
+              keyShiftSemitones: lpCur.keyShiftSemitones,
+              active: lpCur.active,
+              gain: lpCur.gain,
+              loopBeatsOverride: lpCur.loopBeatsOverride,
             }
           : undefined,
       };
@@ -364,6 +430,34 @@ export default function App() {
         deck2Ref.current.keyShiftSemitones * 100 -
         (deck2Ref.current.keyLock ? 1200 * Math.log2(Math.max(0.25, deck2Rate)) : 0);
 
+      const lpCur = looperRef.current;
+      const lpBpm = Math.max(40, lpCur.manualBpm ?? lpCur.track?.exactBpm ?? curState.masterBpm);
+      const lpAnchorMs = lpCur.manualAnchorMs ?? lpCur.track?.firstTransientMs ?? 0;
+      const lpBeatTimes = getAdjustedBeatTimes(lpCur.track, lpBpm, lpAnchorMs);
+      const useTrackedLooper = Boolean(
+        lpCur.track && (!lpCur.track.isConstantTempo || curState.gridMode === 'dynamic')
+      );
+      const lpRate = (curState.masterBpm * lpCur.tempoMultiplier) / lpBpm;
+      const lpDetuneCents =
+        lpCur.keyShiftSemitones * 100 -
+        (lpCur.keyLock ? 1200 * Math.log2(Math.max(0.25, lpRate)) : 0);
+      const lpLoopBeats = lpCur.track
+        ? lpCur.loopBeatsOverride > 0
+          ? lpCur.loopBeatsOverride
+          : computeDetectedLoopBeats(lpCur.track.durationSec, lpBpm, lpAnchorMs)
+        : 16;
+      const lpOffsetSec = lpCur.track
+        ? getTimeAtBeatPosition(
+            ((curState.elapsedBeats * lpCur.tempoMultiplier + lpCur.startBeatOffset) %
+              lpLoopBeats +
+              lpLoopBeats) %
+              lpLoopBeats,
+            useTrackedLooper ? lpBeatTimes : [],
+            lpBpm,
+            lpAnchorMs
+          )
+        : 0;
+
       integralErrRef.current = 0;
 
       audioEngine.startTrackSources({
@@ -373,6 +467,12 @@ export default function App() {
         deck2Rate,
         deck1DetuneCents,
         deck2DetuneCents,
+        looperOffsetSec: lpOffsetSec,
+        looperRate: lpRate,
+        looperDetuneCents: lpDetuneCents,
+        looperLoopDurationSec: (lpLoopBeats * 60) / lpBpm,
+        looperGain: lpCur.gain,
+        looperActive: lpCur.active,
       });
     },
     [buildWorkletParams, crossfader]
@@ -414,8 +514,8 @@ export default function App() {
       const t = tracksRef.current;
       let nextBeats = cur.elapsedBeats + wallDtSec * (cur.masterBpm / 60);
 
-      if (audioEngine.isUsingWorklet() && (t.deck1 || t.deck2)) {
-        // Single-transport-owner: AudioWorklet advances masterBeatPos & regulates Deck 2 in the audio thread
+      if (audioEngine.isUsingWorklet() && (t.deck1 || t.deck2 || t.looper)) {
+        // Single-transport-owner: AudioWorklet advances masterBeatPos & locks Deck 2 + Looper in the audio thread
         const wt = audioEngine.getWorkletTelemetry();
         if (wt) {
           const dtSinceTelemetrySec = Math.min(0.08, Math.max(0, (now - wt.receivedAtPerfMs) / 1000));
@@ -553,6 +653,7 @@ export default function App() {
       }
 
       stateRef.current = { ...cur, elapsedBeats: nextBeats };
+      elapsedBeatsRef.current = nextBeats;
 
       const wholeBeat = Math.floor(nextBeats);
       if (wholeBeat > lastWholeBeat) {
@@ -633,6 +734,17 @@ export default function App() {
     deck2.tempoMultiplier,
     deck2.keyLock,
     deck2.keyShiftSemitones,
+    looper.track,
+    looperBpm,
+    looperAnchorMs,
+    looperBeatTimes,
+    looper.startBeatOffset,
+    looper.tempoMultiplier,
+    looper.keyLock,
+    looper.keyShiftSemitones,
+    looper.active,
+    looper.gain,
+    looper.loopBeatsOverride,
     autoNudgeEnabled,
     maxNudgeTrimPct,
     crossfader,
@@ -712,6 +824,29 @@ export default function App() {
         };
         ref.current = nextDeck;
         setter(nextDeck);
+      }
+
+      // Also keep Audio Looper Slot rhythmically aligned if a loop is loaded and Deck 1 (or Deck 2 fallback) changes
+      const curLooper = looperRef.current;
+      if (curLooper.track) {
+        const refDeck = deck === 1 ? { track, startBeatOffset: deck1Ref.current.startBeatOffset } : deck1Ref.current.track ? deck1Ref.current : { track, startBeatOffset: deck2Ref.current.startBeatOffset };
+        if (refDeck.track) {
+          const lpMatch = matchRhythmicStartingPoint(
+            refDeck.track,
+            curLooper.track,
+            refDeck.startBeatOffset
+          );
+          setLooper((prev) => {
+            const nextLp: LooperUiInfo = {
+              ...prev,
+              startBeatOffset: lpMatch.startBeatOffset,
+              tempoMultiplier: lpMatch.tempoMultiplier,
+              rhythmMatchPct: lpMatch.matchScorePct,
+            };
+            looperRef.current = nextLp;
+            return nextLp;
+          });
+        }
       }
     },
     []
@@ -893,6 +1028,208 @@ export default function App() {
     setter((prev) => {
       const next = { ...prev, keyShiftSemitones: shift };
       ref.current = next;
+      return next;
+    });
+  }, []);
+
+  // --- Audio Looper Slot Handlers ---
+  const applyLooperTrackWithSync = useCallback((track: LoadedDeckTrack) => {
+    const refDeck = deck1Ref.current.track
+      ? deck1Ref.current
+      : deck2Ref.current.track
+        ? deck2Ref.current
+        : null;
+    const match = refDeck?.track
+      ? matchRhythmicStartingPoint(refDeck.track, track, refDeck.startBeatOffset)
+      : null;
+    const soloStart = computeSoloStartBeat(track);
+
+    const nextLooper: LooperUiInfo = {
+      ...looperRef.current,
+      track,
+      loading: false,
+      error: null,
+      manualBpm: null,
+      manualAnchorMs: track.firstTransientMs,
+      startBeatOffset: match ? match.startBeatOffset : soloStart,
+      tempoMultiplier: match ? match.tempoMultiplier : 1,
+      rhythmMatchPct: match ? match.matchScorePct : null,
+      keyShiftSemitones: 0,
+      active: true,
+      loopBeatsOverride: 0,
+    };
+    looperRef.current = nextLooper;
+    setLooper(nextLooper);
+
+    if (!deck1Ref.current.track && !deck2Ref.current.track) {
+      setState((prev) => {
+        const next: CalibrationState = {
+          ...prev,
+          masterBpm: track.exactBpm,
+          gridOffsetMs: 0,
+          syncMode: 'beat',
+          quantize: true,
+          gridMode: track.isConstantTempo ? 'straight' : 'dynamic',
+          elapsedBeats: 0,
+        };
+        stateRef.current = next;
+        elapsedBeatsRef.current = 0;
+        return next;
+      });
+      setBarBeatDisplay('01.1.1');
+    }
+  }, []);
+
+  const handleLoadLooperFile = useCallback(
+    async (file: File) => {
+      setLooper((prev) => ({ ...prev, loading: true, error: null }));
+      try {
+        const track = await audioEngine.loadLooperFile(file);
+        applyLooperTrackWithSync(track);
+      } catch (err) {
+        setLooper((prev) => ({
+          ...prev,
+          loading: false,
+          error:
+            err instanceof Error
+              ? `Could not decode loop file: ${err.message}`
+              : 'Unsupported or corrupted audio loop file.',
+        }));
+      }
+    },
+    [applyLooperTrackWithSync]
+  );
+
+  const handleLoadDemoLooper = useCallback(() => {
+    const targetBpm = Math.round(stateRef.current.masterBpm) || 124;
+    const track = audioEngine.loadDemoLooper(
+      targetBpm,
+      0,
+      `Demo Top & Bass Loop (${targetBpm} BPM · 16b)`
+    );
+    applyLooperTrackWithSync(track);
+  }, [applyLooperTrackWithSync]);
+
+  const handleClearLooper = useCallback(() => {
+    audioEngine.clearLooper();
+    looperRef.current = EMPTY_LOOPER;
+    setLooper(EMPTY_LOOPER);
+    if (!deck1Ref.current.track && !deck2Ref.current.track) {
+      setIsPlaying(false);
+    }
+  }, []);
+
+  const handleLooperToggleActive = useCallback(() => {
+    setLooper((prev) => {
+      const next = { ...prev, active: !prev.active };
+      looperRef.current = next;
+      audioEngine.setLooperGain(next.gain, next.active);
+      return next;
+    });
+  }, []);
+
+  const handleLooperGainChange = useCallback((gain: number) => {
+    setLooper((prev) => {
+      const next = { ...prev, gain };
+      looperRef.current = next;
+      audioEngine.setLooperGain(next.gain, next.active);
+      return next;
+    });
+  }, []);
+
+  const handleLooperBpmChange = useCallback((bpm: number) => {
+    setLooper((prev) => {
+      const next = { ...prev, manualBpm: bpm };
+      looperRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const handleLooperAnchorShift = useCallback((deltaMs: number) => {
+    setLooper((prev) => {
+      const cur = prev.manualAnchorMs ?? prev.track?.firstTransientMs ?? 0;
+      const nextAnchor = Math.max(0, Number((cur + deltaMs).toFixed(2)));
+      const next = { ...prev, manualAnchorMs: nextAnchor };
+      looperRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const handleLooperLoopBeatsChange = useCallback((beats: number) => {
+    setLooper((prev) => {
+      const next = { ...prev, loopBeatsOverride: beats };
+      looperRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const handleLooperStartBeatSelect = useCallback((beatInBar: number) => {
+    const clampedBeat = ((Math.round(beatInBar) % 4) + 4) % 4;
+    setLooper((prev) => {
+      if (!prev.track) return prev;
+      const baseBarOffset = Math.floor(prev.startBeatOffset / 4) * 4;
+      const candidate = baseBarOffset + clampedBeat;
+      const nextStart = candidate < prev.track.beatTimesSec.length ? candidate : clampedBeat;
+      const next = { ...prev, startBeatOffset: nextStart };
+      looperRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const handleLooperAutoMatchRhythm = useCallback(() => {
+    const lp = looperRef.current;
+    const refDeck = deck1Ref.current.track
+      ? deck1Ref.current
+      : deck2Ref.current.track
+        ? deck2Ref.current
+        : null;
+    if (!lp.track || !refDeck?.track) return;
+    const match = matchRhythmicStartingPoint(refDeck.track, lp.track, refDeck.startBeatOffset);
+    setLooper((prev) => {
+      const next: LooperUiInfo = {
+        ...prev,
+        startBeatOffset: match.startBeatOffset,
+        tempoMultiplier: match.tempoMultiplier,
+        rhythmMatchPct: match.matchScorePct,
+      };
+      looperRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const handleLooperToggleKeyLock = useCallback(() => {
+    setLooper((prev) => {
+      const next = { ...prev, keyLock: !prev.keyLock };
+      looperRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const handleLooperKeyShiftChange = useCallback((semitones: number) => {
+    const clamped = Math.max(-12, Math.min(12, Math.round(semitones)));
+    setLooper((prev) => {
+      const next = { ...prev, keyShiftSemitones: clamped };
+      looperRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const handleLooperMatchKeyToMaster = useCallback(() => {
+    const lp = looperRef.current;
+    const refDeck = deck1Ref.current.track
+      ? deck1Ref.current
+      : deck2Ref.current.track
+        ? deck2Ref.current
+        : null;
+    if (!lp.track || !refDeck?.track) return;
+    const masterSoundingKey = transposeKeyInfo(
+      refDeck.track.musicalKey,
+      refDeck.keyShiftSemitones
+    );
+    const shift = findOptimalSemitoneMatch(lp.track.musicalKey, masterSoundingKey);
+    setLooper((prev) => {
+      const next = { ...prev, keyShiftSemitones: shift };
+      looperRef.current = next;
       return next;
     });
   }, []);
@@ -1148,7 +1485,38 @@ export default function App() {
             onApplyDetectedTransientOffset={handleSnapToZero}
           />
 
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          <AudioLooperSlot
+            looper={looper}
+            masterBpm={state.masterBpm}
+            masterDeckLabel={
+              deck1.track ? 'Deck 1' : deck2.track ? 'Deck 2' : null
+            }
+            masterKey={
+              deck1.track
+                ? transposeKeyInfo(deck1.track.musicalKey, deck1.keyShiftSemitones)
+                : deck2.track
+                  ? transposeKeyInfo(deck2.track.musicalKey, deck2.keyShiftSemitones)
+                  : null
+            }
+            isPlaying={isPlaying}
+            audioEnabled={audioEnabled}
+            elapsedBeatsRef={elapsedBeatsRef}
+            onLoadFile={handleLoadLooperFile}
+            onLoadDemo={handleLoadDemoLooper}
+            onClear={handleClearLooper}
+            onToggleActive={handleLooperToggleActive}
+            onGainChange={handleLooperGainChange}
+            onBpmChange={handleLooperBpmChange}
+            onAnchorShift={handleLooperAnchorShift}
+            onLoopBeatsChange={handleLooperLoopBeatsChange}
+            onStartBeatSelect={handleLooperStartBeatSelect}
+            onAutoMatchRhythm={handleLooperAutoMatchRhythm}
+            onToggleKeyLock={handleLooperToggleKeyLock}
+            onKeyShiftChange={handleLooperKeyShiftChange}
+            onMatchKeyToMaster={handleLooperMatchKeyToMaster}
+          />
+
+          <div className="mt-5 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
             <div className="lg:col-span-7 xl:col-span-8">
               <PhaseCanvasStage
                 stateRef={stateRef}

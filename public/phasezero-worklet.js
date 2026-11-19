@@ -45,6 +45,7 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
     // Preallocated stereo sample scratch buffers (zero heap allocation inside process)
     this.stereoBuf1 = [0, 0];
     this.stereoBuf2 = [0, 0];
+    this.stereoBufLooper = [0, 0];
     this.stereoBufOld = [0, 0];
 
     // Precomputed LUTs for N=2048 FFT, root-Hann window, and bin frequencies
@@ -85,6 +86,7 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
       1: this.createEmptyDeck(),
       2: this.createEmptyDeck(),
     };
+    this.looper = this.createEmptyLooper();
 
     this.port.onmessage = (event) => {
       const msg = event.data;
@@ -121,6 +123,45 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
         case 'clearDeck': {
           const deckNum = msg.deck === 2 ? 2 : 1;
           this.decks[deckNum] = this.createEmptyDeck();
+          break;
+        }
+        case 'loadLooperTrack': {
+          const prev = this.looper;
+          const pv = prev ? prev.pv : this.createPvState();
+          this.resetPvState(pv);
+          this.looper = {
+            channels: msg.channels || null,
+            length: msg.length || 0,
+            sampleRate: msg.trackSampleRate || sampleRate,
+            durationSec: msg.durationSec || 0,
+            bpm: Math.max(40, msg.bpm || 124),
+            anchorSec: Math.max(0, (msg.anchorMs || 0) / 1000),
+            beatTimesSec: msg.beatTimesSec ? new Float64Array(msg.beatTimesSec) : null,
+            useBeatTimes: Boolean(msg.useBeatTimes),
+            startBeatOffset:
+              typeof msg.startBeatOffset === 'number' ? Math.max(0, msg.startBeatOffset) : 0,
+            tempoMultiplier:
+              msg.tempoMultiplier === 0.5 || msg.tempoMultiplier === 2 ? msg.tempoMultiplier : 1,
+            keyLock: typeof msg.keyLock === 'boolean' ? msg.keyLock : prev ? prev.keyLock : true,
+            keyShiftSemitones:
+              typeof msg.keyShiftSemitones === 'number'
+                ? Math.max(-12, Math.min(12, msg.keyShiftSemitones))
+                : 0,
+            active: typeof msg.active === 'boolean' ? msg.active : prev ? prev.active : true,
+            gain:
+              typeof msg.gain === 'number'
+                ? Math.max(0, Math.min(1.5, msg.gain))
+                : prev
+                  ? prev.gain
+                  : 0.85,
+            loopBeatsOverride:
+              typeof msg.loopBeatsOverride === 'number' ? Math.max(0, msg.loopBeatsOverride) : 0,
+            pv,
+          };
+          break;
+        }
+        case 'clearLooper': {
+          this.looper = this.createEmptyLooper();
           break;
         }
         case 'setParams': {
@@ -187,6 +228,58 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
               }
             }
           }
+          if (msg.looperGrid && this.looper) {
+            const patch = msg.looperGrid;
+            const lp = this.looper;
+            let needsPvReset = false;
+            if (typeof patch.bpm === 'number') lp.bpm = Math.max(40, patch.bpm);
+            if (typeof patch.anchorMs === 'number') {
+              const nextAnchor = Math.max(0, patch.anchorMs / 1000);
+              if (Math.abs(nextAnchor - lp.anchorSec) > 0.0005) needsPvReset = true;
+              lp.anchorSec = nextAnchor;
+            }
+            if (typeof patch.useBeatTimes === 'boolean') {
+              lp.useBeatTimes = patch.useBeatTimes;
+            }
+            if (patch.beatTimesSec) {
+              lp.beatTimesSec = new Float64Array(patch.beatTimesSec);
+            }
+            if (typeof patch.startBeatOffset === 'number') {
+              const nextOff = Math.max(0, patch.startBeatOffset);
+              if (nextOff !== lp.startBeatOffset) needsPvReset = true;
+              lp.startBeatOffset = nextOff;
+            }
+            if (
+              patch.tempoMultiplier === 0.5 ||
+              patch.tempoMultiplier === 1 ||
+              patch.tempoMultiplier === 2
+            ) {
+              if (patch.tempoMultiplier !== lp.tempoMultiplier) needsPvReset = true;
+              lp.tempoMultiplier = patch.tempoMultiplier;
+            }
+            if (typeof patch.keyLock === 'boolean') {
+              if (patch.keyLock !== lp.keyLock) needsPvReset = true;
+              lp.keyLock = patch.keyLock;
+            }
+            if (typeof patch.keyShiftSemitones === 'number') {
+              lp.keyShiftSemitones = Math.max(-12, Math.min(12, patch.keyShiftSemitones));
+            }
+            if (typeof patch.active === 'boolean') {
+              if (patch.active && !lp.active) needsPvReset = true;
+              lp.active = patch.active;
+            }
+            if (typeof patch.gain === 'number') {
+              lp.gain = Math.max(0, Math.min(1.5, patch.gain));
+            }
+            if (typeof patch.loopBeatsOverride === 'number') {
+              const nextOv = Math.max(0, patch.loopBeatsOverride);
+              if (nextOv !== lp.loopBeatsOverride) needsPvReset = true;
+              lp.loopBeatsOverride = nextOv;
+            }
+            if (needsPvReset) {
+              this.resetPvState(lp.pv);
+            }
+          }
           break;
         }
         case 'start': {
@@ -199,6 +292,7 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
           this.xfadeRemaining = 0;
           this.resetPvState(this.decks[1].pv);
           this.resetPvState(this.decks[2].pv);
+          this.resetPvState(this.looper.pv);
           if (msg.resetCounters) {
             this.hardSnapCount = 0;
             this.snappedRecentlyBlocks = 0;
@@ -214,6 +308,7 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
           this.xfadeRemaining = 0;
           this.resetPvState(this.decks[1].pv);
           this.resetPvState(this.decks[2].pv);
+          this.resetPvState(this.looper.pv);
           break;
         }
         case 'seek': {
@@ -227,6 +322,7 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
           this.currentRateTrimFrac = 0;
           this.resetPvState(this.decks[1].pv);
           this.resetPvState(this.decks[2].pv);
+          this.resetPvState(this.looper.pv);
           this.emitTelemetry();
           break;
         }
@@ -319,8 +415,16 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
       tempoMultiplier: 1,
       keyLock: true,
       keyShiftSemitones: 0,
+      loopBeatsOverride: 0,
       pv: this.createPvState(),
     };
+  }
+
+  createEmptyLooper() {
+    const deck = this.createEmptyDeck();
+    deck.active = true;
+    deck.gain = 0.85;
+    return deck;
   }
 
   wrapHalfBeat(deltaBeats) {
@@ -330,6 +434,9 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
   }
 
   getLoopBeats(deck) {
+    if (typeof deck.loopBeatsOverride === 'number' && deck.loopBeatsOverride >= 0.25) {
+      return deck.loopBeatsOverride;
+    }
     const beatSec = 60 / Math.max(40, deck.bpm);
     const rawPlayableBeats = Math.max(0.25, (deck.durationSec - deck.anchorSec) / beatSec);
     // Allow up to 0.14 beat (~65 ms) trim tolerance at loop tail so shy-cut loops don't drop a beat
@@ -892,6 +999,17 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
     const { audibleMs } = this.computeCurrentErrorMetrics();
     const d1Time = this.getTrackTimeSec(this.decks[1], this.masterBeatPos);
     const d2Time = this.getTrackTimeSec(this.decks[2], this.deck2BeatPos);
+    const lp = this.looper;
+    const hasLooper = Boolean(lp && lp.channels && lp.length > 1);
+    const looperLoopBeats = hasLooper ? this.getLoopBeats(lp) : 4;
+    const looperShiftedBeat = hasLooper
+      ? this.masterBeatPos * (lp.tempoMultiplier || 1) + (lp.startBeatOffset || 0)
+      : 0;
+    const looperBeatPos = hasLooper
+      ? ((looperShiftedBeat % looperLoopBeats) + looperLoopBeats) % looperLoopBeats
+      : 0;
+    const looperTimeSec = hasLooper ? this.getTrackTimeSec(lp, this.masterBeatPos) : 0;
+
     this.port.postMessage({
       type: 'telemetry',
       masterBeatPos: this.masterBeatPos,
@@ -902,6 +1020,10 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
       rateTrimPct: Number((this.currentRateTrimFrac * 100).toFixed(3)),
       hardSnapCount: this.hardSnapCount,
       justSnapped: this.snappedRecentlyBlocks > 0,
+      looperTimeSec: looperTimeSec >= 0 ? looperTimeSec : 0,
+      looperBeatPos,
+      looperLoopBeats,
+      looperPhaseErrorMs: 0,
     });
   }
 
@@ -921,11 +1043,14 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
 
     const d1 = this.decks[1];
     const d2 = this.decks[2];
+    const lp = this.looper;
     const hasD1 = Boolean(d1 && d1.channels && d1.length > 1);
     const hasD2 = Boolean(d2 && d2.channels && d2.length > 1);
+    const hasLooper = Boolean(lp && lp.channels && lp.length > 1);
 
     const g1 = this.crossfader <= 0 ? 0.85 : Math.max(0, 0.85 * (1 - this.crossfader));
     const g2 = this.crossfader >= 0 ? 0.85 : Math.max(0, 0.85 * (1 + this.crossfader));
+    const looperGain = lp && lp.active ? Math.max(0, Math.min(1.5, lp.gain)) : 0;
 
     const dtBlockSec = blockFrames / sampleRate;
     const nudgeActive =
@@ -985,6 +1110,9 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
     const d2StepPerSample = (d2BaseBpm * (1 + rateTrimFrac)) / 60 / sampleRate;
     const d2TempoRatio =
       (d2BaseBpm * (1 + rateTrimFrac) * (d2.tempoMultiplier || 1)) / Math.max(40, d2.bpm);
+    const looperTempoRatio = hasLooper
+      ? (this.masterBpm * (lp.tempoMultiplier || 1)) / Math.max(40, lp.bpm)
+      : 1;
 
     for (let i = 0; i < blockFrames; i++) {
       let l = 0;
@@ -1035,6 +1163,19 @@ class PhaseZeroWorkletProcessor extends AudioWorkletProcessor {
 
         l += d2L * g2;
         r += d2R * g2;
+      }
+
+      if (hasLooper && looperGain > 0.0005) {
+        this.sampleDeckStereoWithKey(
+          lp,
+          this.masterBeatPos,
+          d1StepPerSample,
+          looperTempoRatio,
+          this.stereoBufLooper,
+          true
+        );
+        l += this.stereoBufLooper[0] * looperGain;
+        r += this.stereoBufLooper[1] * looperGain;
       }
 
       outL[i] = l;
